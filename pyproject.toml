@@ -1,0 +1,80 @@
+[project]
+name = "codex-provider-switchboard"
+version = "0.2.0"
+description = "A local Responses-compatible switchboard for Codex, Kiro CLI, Cursor CLI, and provider APIs"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [{ name = "Codex Provider Switchboard contributors" }]
+keywords = ["codex", "responses-api", "kiro", "cursor", "proxy"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Framework :: FastAPI",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Typing :: Typed",
+]
+
+urls = { Homepage = "https://github.com/qaz553286745/codex-provider-switchboard", Repository = "https://github.com/qaz553286745/codex-provider-switchboard", Issues = "https://github.com/qaz553286745/codex-provider-switchboard/issues", Changelog = "https://github.com/qaz553286745/codex-provider-switchboard/blob/main/CHANGELOG.md" }
+dependencies = [
+    "fastapi==0.139.0",
+    "httpx==0.28.1",
+    "tomlkit==0.15.1",
+    "uvicorn==0.51.0",
+    "websockets==16.1.1",
+    "zstandard==0.25.0",
+]
+
+[project.scripts]
+codex-provider-switchboard = "codex_provider_switchboard.cli:main"
+
+[dependency-groups]
+dev = [
+    "build==1.5.0",
+    "httpx2==2.9.0",
+    "pre-commit==4.6.0",
+    "pytest==9.1.1",
+    "pytest-cov==7.1.0",
+    "ruff==0.15.22",
+    "twine==6.2.0",
+]
+
+[build-system]
+# Hatchling 1.32 defaults to Core Metadata 2.5, which current Twine/PyPI
+# validation does not accept yet. Keep release artifacts on metadata 2.4.
+requires = ["hatchling==1.31.0"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/codex_provider_switchboard"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+
+[tool.coverage.run]
+branch = true
+source = ["codex_provider_switchboard"]
+
+[tool.coverage.report]
+fail_under = 60
+show_missing = true
+skip_covered = true
+
+[tool.ruff]
+target-version = "py311"
+line-length = 88
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["B", "C4", "E", "F", "I", "PIE", "RET", "RUF", "S", "SIM", "UP"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S108"]

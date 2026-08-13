@@ -1,0 +1,409 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <title>Codex Provider Switchboard</title>
+    <link rel="stylesheet" href="/static/app.css" />
+    <script defer src="/static/app.js"></script>
+  </head>
+  <body>
+    <div class="ambient ambient-one"></div>
+    <div class="ambient ambient-two"></div>
+    <main class="shell">
+      <header class="topbar">
+        <div class="brand">
+          <div class="brand-mark" aria-hidden="true">
+            <span></span><span></span><span></span>
+          </div>
+          <div>
+            <p class="eyebrow">LOCAL CONTROL PLANE</p>
+            <h1>Codex Switchboard</h1>
+          </div>
+        </div>
+        <div class="service-pill" id="service-pill">
+          <span class="pulse"></span>
+          <span id="service-label">正在连接本地代理</span>
+        </div>
+      </header>
+
+      <section class="hero panel">
+        <div>
+          <p class="eyebrow">ACTIVE ROUTE</p>
+          <h2>一个本地地址，切换四类模型链路。</h2>
+          <p class="hero-copy">
+            Codex 始终连接 <code id="endpoint-base">127.0.0.1:8787/v1</code>。这里统一管理
+            Kiro CLI、Cursor Agent CLI / Cloud API、原生多平台连接与第三方 Responses API，同时保留任务上下文与流式输出。
+          </p>
+        </div>
+        <button class="copy-button" id="copy-url" type="button">
+          <span>复制代理地址</span>
+          <strong id="copy-url-value">127.0.0.1:8787/v1</strong>
+        </button>
+      </section>
+
+      <section class="section-heading">
+        <div>
+          <p class="eyebrow">PROVIDERS</p>
+          <h2>选择当前厂家</h2>
+        </div>
+        <p>切换立即生效，新请求会走所选链路。</p>
+      </section>
+
+      <section class="provider-grid" aria-label="厂家选择">
+        <article class="provider-card" data-provider-card="kiro">
+          <div class="provider-topline">
+            <label class="provider-choice">
+              <input type="radio" name="provider" value="kiro" />
+              <span class="radio-ui"></span><span>使用 Kiro</span>
+            </label>
+            <span class="status-badge" id="kiro-status">检查中</span>
+          </div>
+          <div class="provider-icon kiro-icon" aria-hidden="true">K</div>
+          <h3>Kiro CLI</h3>
+          <p>调用这台 Mac 已登录的 Kiro CLI，不读取或复制 Kiro 登录令牌。</p>
+          <dl class="facts">
+            <div><dt>模型</dt><dd id="kiro-model">—</dd></div>
+            <div><dt>推理</dt><dd><span class="param-chip accent">--effort max</span></dd></div>
+            <div><dt>会话</dt><dd>Codex 任务 ↔ Kiro Session</dd></div>
+            <div><dt>并行</dt><dd id="kiro-concurrency">—</dd></div>
+          </dl>
+        </article>
+
+        <article class="provider-card" data-provider-card="cursor">
+          <div class="provider-topline">
+            <label class="provider-choice">
+              <input type="radio" name="provider" value="cursor" />
+              <span class="radio-ui"></span><span>使用 Cursor</span>
+            </label>
+            <span class="status-badge" id="cursor-status">未配置</span>
+          </div>
+          <div class="provider-icon cursor-icon" aria-hidden="true">C</div>
+          <h3>Cursor Agent</h3>
+          <p>默认调用本机 Cursor CLI；需要时可切回官方 Cloud Agents API。</p>
+          <dl class="facts">
+            <div><dt>后端</dt><dd id="cursor-backend-summary">本地 CLI</dd></div>
+            <div><dt>认证</dt><dd id="cursor-auth">等待 API Key</dd></div>
+            <div><dt>模型</dt><dd id="cursor-model-summary">Cursor 默认模型</dd></div>
+            <div><dt>并行</dt><dd id="cursor-concurrency">—</dd></div>
+          </dl>
+        </article>
+
+        <article class="provider-card" data-provider-card="custom">
+          <div class="provider-topline">
+            <label class="provider-choice">
+              <input type="radio" name="provider" value="custom" />
+              <span class="radio-ui"></span><span>使用第三方</span>
+            </label>
+            <span class="status-badge" id="custom-status">未配置</span>
+          </div>
+          <div class="provider-icon custom-icon" aria-hidden="true">R</div>
+          <h3>Responses API</h3>
+          <p>连接自定义 HTTPS 网关，原样转发 Responses JSON 与 SSE 数据流。</p>
+          <dl class="facts">
+            <div><dt>地址</dt><dd id="custom-base-summary">等待配置</dd></div>
+            <div><dt>模型</dt><dd id="custom-model-summary">第三方默认模型</dd></div>
+            <div><dt>认证</dt><dd id="custom-auth">等待 API Key</dd></div>
+          </dl>
+        </article>
+
+        <article class="provider-card" data-provider-card="direct">
+          <div class="provider-topline">
+            <label class="provider-choice">
+              <input type="radio" name="provider" value="direct" />
+              <span class="radio-ui"></span><span>使用原生平台</span>
+            </label>
+            <span class="status-badge" id="direct-status">未认证</span>
+          </div>
+          <div class="provider-icon direct-icon" aria-hidden="true">D</div>
+          <h3>Direct Providers</h3>
+          <p>Switchboard 自有的 Python 协议栈；不加载 Pi、Node SDK 或其他代理进程。</p>
+          <dl class="facts">
+            <div><dt>平台</dt><dd id="direct-platform-summary">ChatGPT Codex</dd></div>
+            <div><dt>认证</dt><dd id="direct-auth-summary">等待登录</dd></div>
+            <div><dt>模型</dt><dd id="direct-model-summary">gpt-5.6-sol</dd></div>
+            <div><dt>级别</dt><dd id="direct-stability-summary">实验性</dd></div>
+          </dl>
+        </article>
+      </section>
+
+      <section class="panel usage-panel">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">USAGE & QUOTA</p>
+            <h2>余量与额度</h2>
+          </div>
+          <p class="panel-caption">只读取官方或你明确配置的额度端点，不推算账户余额。</p>
+        </div>
+        <div class="usage-grid">
+          <article class="usage-card">
+            <div class="usage-title"><strong>Kiro</strong><span id="kiro-quota-badge">未查询</span></div>
+            <div class="quota-content" id="kiro-quota"><p>点击刷新，读取 Kiro CLI 的 <code>/usage</code>。</p></div>
+            <button class="ghost-button compact" data-refresh-quota="kiro" type="button">刷新额度</button>
+          </article>
+          <article class="usage-card">
+            <div class="usage-title"><strong>Cursor</strong><span id="cursor-quota-badge">未查询</span></div>
+            <div class="quota-content" id="cursor-quota"><p>验证 API Key，并显示最近一次 CLI / API 调用的 Token 用量。</p></div>
+            <button class="ghost-button compact" data-refresh-quota="cursor" type="button">刷新状态</button>
+          </article>
+          <article class="usage-card">
+            <div class="usage-title"><strong>第三方</strong><span id="custom-quota-badge">未查询</span></div>
+            <div class="quota-content" id="custom-quota"><p>可配置额度端点和 JSON 字段路径。</p></div>
+            <button class="ghost-button compact" data-refresh-quota="custom" type="button">刷新额度</button>
+          </article>
+          <article class="usage-card">
+            <div class="usage-title"><strong>原生平台</strong><span id="direct-quota-badge">未查询</span></div>
+            <div class="quota-content" id="direct-quota"><p>OpenRouter 可读取 Key 额度；其他平台显示最近一次请求用量或官方支持状态。</p></div>
+            <button class="ghost-button compact" data-refresh-quota="direct" type="button">刷新状态</button>
+          </article>
+        </div>
+      </section>
+
+      <section class="panel config-panel">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">KIRO CONFIGURATION</p>
+            <h2>Kiro 模型</h2>
+          </div>
+          <a class="docs-link" href="https://kiro.dev/docs/cli/models/" target="_blank" rel="noreferrer">官方模型文档 ↗</a>
+        </div>
+        <div class="form-grid single-row-form">
+          <label class="field">
+            <span>当前模型</span><span class="field-note">来自 kiro-cli chat --list-models</span>
+            <select id="kiro-model-select" disabled><option>正在读取模型目录…</option></select>
+          </label>
+          <div class="field button-field">
+            <span>目录操作</span><span class="field-note">读取当前账号和地区真实可用模型</span>
+            <div class="inline-buttons">
+              <button class="secondary-button" id="refresh-kiro-models" type="button">刷新官方目录</button>
+              <button class="primary-button" id="save-kiro" type="button">应用 Kiro 模型</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel config-panel" id="direct-configuration">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">NATIVE PROVIDER CONFIGURATION</p>
+            <h2>原生多平台连接</h2>
+          </div>
+          <span class="security-note">独立凭据文件 0600 · 不读取 Codex 登录文件</span>
+        </div>
+        <div class="form-grid">
+          <label class="field">
+            <span>平台</span><span class="field-note">固定官方域名，不允许自定义跳转</span>
+            <select id="direct-platform"></select>
+          </label>
+          <label class="field">
+            <span>模型</span><span class="field-note" id="direct-model-source">读取官方模型目录或受控内置目录</span>
+            <select id="direct-model" disabled><option>等待读取模型目录…</option></select>
+          </label>
+          <div class="field full-field direct-provider-note">
+            <span>支持状态</span>
+            <div class="provider-note-row">
+              <span class="status-badge" id="direct-platform-stability">检查中</span>
+              <p id="direct-platform-note">选择平台后显示协议与认证说明。</p>
+            </div>
+          </div>
+          <label class="field full-field">
+            <span>API Key</span><span class="field-note" id="direct-key-note">支持的平台可保存到独立凭据文件；环境变量优先</span>
+            <div class="secret-row direct-secret-row">
+              <input id="direct-key" type="password" autocomplete="new-password" spellcheck="false" placeholder="输入所选平台的 API Key" />
+              <button class="secondary-button" id="save-direct-key" type="button">保存并校验</button>
+              <button class="secondary-button" id="import-pi-kiro" type="button" hidden>导入 Pi 的 Kiro 认证</button>
+              <button class="secondary-button" id="login-direct" type="button">登录账号</button>
+              <button class="ghost-button" id="logout-direct" type="button">清除认证</button>
+            </div>
+          </label>
+          <div class="field full-field" id="direct-kiro-options" hidden>
+            <span>Kiro Identity Center（可选）</span><span class="field-note">留空使用 AWS Builder ID；也可显式导入 ~/.pi/agent/auth.json 中的 Kiro 认证</span>
+            <div class="mapping-grid compact-options">
+              <label class="field"><span>Start URL</span><input id="direct-kiro-start-url" type="url" spellcheck="false" placeholder="https://example.awsapps.com/start" /></label>
+              <label class="field"><span>Region</span><select id="direct-kiro-region"><option value="">自动检测</option><option value="us-east-1">us-east-1</option><option value="eu-west-1">eu-west-1</option><option value="eu-central-1">eu-central-1</option><option value="ap-southeast-1">ap-southeast-1</option><option value="ap-northeast-1">ap-northeast-1</option><option value="us-west-2">us-west-2</option></select></label>
+            </div>
+          </div>
+          <section class="oauth-progress full-field" id="direct-login-progress" aria-live="polite" hidden>
+            <div>
+              <strong id="direct-login-title">正在启动登录…</strong>
+              <p id="direct-login-message">请稍候。</p>
+            </div>
+            <div class="oauth-actions">
+              <a class="secondary-button oauth-link" id="direct-login-link" target="_blank" rel="noreferrer" hidden>打开认证页面 ↗</a>
+              <code id="direct-login-code" hidden></code>
+              <input id="direct-login-input" type="text" autocomplete="off" spellcheck="false" placeholder="粘贴授权码或回调 URL" hidden />
+              <button class="secondary-button" id="direct-login-respond" type="button" hidden>提交</button>
+              <button class="ghost-button" id="direct-login-cancel" type="button">取消登录</button>
+            </div>
+          </section>
+          <label class="switch-row full-field">
+            <span><strong>跟随 Codex 推理档位</strong><small>将 Codex 的 low / high / xhigh / max 映射到平台支持的推理配置</small></span>
+            <input id="direct-follow-effort" type="checkbox" checked /><span class="switch-ui" aria-hidden="true"></span>
+          </label>
+        </div>
+        <div class="panel-actions">
+          <p>API Key 模式为稳定首选；ChatGPT、Claude、Copilot、xAI 与 Kiro 的账号 OAuth 适配会按平台标注实验级别。</p>
+          <div class="inline-buttons">
+            <button class="ghost-button" id="refresh-direct-models" type="button">刷新模型目录</button>
+            <button class="primary-button" id="save-direct" type="button">应用原生平台配置</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel config-panel">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">CURSOR CONFIGURATION</p>
+            <h2>Cursor Agent 配置</h2>
+          </div>
+          <a class="docs-link" href="https://docs.cursor.com/en/cli/overview" target="_blank" rel="noreferrer">官方 CLI 文档 ↗</a>
+        </div>
+        <div class="form-grid">
+          <label class="field full-field">
+            <span>运行后端</span><span class="field-note">本地 CLI 为默认；Cloud API 作为兼容选项保留</span>
+            <select id="cursor-backend">
+              <option value="cli">本地 Cursor Agent CLI（推荐）</option>
+              <option value="cloud_api">Cursor Cloud Agents API</option>
+            </select>
+          </label>
+          <label class="field full-field">
+            <span>API Key</span><span class="field-note" id="key-note">只保存在本机，网页不会读回明文</span>
+            <div class="secret-row">
+              <input id="cursor-key" type="password" autocomplete="new-password" spellcheck="false" placeholder="粘贴 crsr_…" />
+              <button class="secondary-button" id="test-cursor" type="button">保存并校验</button>
+              <button class="ghost-button" id="clear-cursor-key" type="button">清除密钥</button>
+            </div>
+          </label>
+          <label class="field">
+            <span>模型</span><span class="field-note" id="cursor-model-source">来自 cursor-agent --list-models</span>
+            <select id="cursor-model" disabled><option>先保存并校验 API Key</option></select>
+          </label>
+          <label class="field">
+            <span>模型变体</span><span class="field-note">官方公布的参数组合</span>
+            <select id="cursor-variant" disabled><option>先读取模型目录</option></select>
+          </label>
+          <div class="field full-field">
+            <span>模型参数</span><span class="field-note">CLI 使用展开后的模型 ID；Cloud API 原样发送 model.params</span>
+            <div class="param-list" id="cursor-params"><span class="empty-chip">使用 Cursor 默认参数</span></div>
+          </div>
+          <label class="switch-row full-field">
+            <span><strong>跟随 Codex 推理档位</strong><small>CLI 选择对应的 low / high / xhigh / max 模型；Cloud API 使用官方参数</small></span>
+            <input id="follow-effort" type="checkbox" checked /><span class="switch-ui" aria-hidden="true"></span>
+          </label>
+        </div>
+        <div class="panel-actions">
+          <p id="config-path">Switchboard 配置：—</p>
+          <button class="primary-button" id="save-cursor" type="button">应用 Cursor 配置</button>
+        </div>
+      </section>
+
+      <section class="panel config-panel">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">THIRD-PARTY RESPONSES</p>
+            <h2>第三方代理配置</h2>
+          </div>
+          <span class="security-note">远程地址强制 HTTPS · 不跟随重定向</span>
+        </div>
+        <div class="form-grid">
+          <label class="field full-field">
+            <span>API Key</span><span class="field-note" id="custom-key-note">也可通过 THIRD_PARTY_API_KEY 注入</span>
+            <div class="secret-row">
+              <input id="custom-key" type="password" autocomplete="new-password" spellcheck="false" placeholder="粘贴第三方 API Key" />
+              <button class="secondary-button" id="test-custom" type="button">保存并校验</button>
+              <button class="ghost-button" id="clear-custom-key" type="button">清除密钥</button>
+            </div>
+          </label>
+          <label class="field">
+            <span>Base URL</span><span class="field-note">填写 /responses 的上一级地址</span>
+            <input id="custom-base-url" type="url" spellcheck="false" placeholder="https://api.example.com/v1" />
+          </label>
+          <label class="field">
+            <span>模型 ID</span><span class="field-note">可手填，也可从 /models 选择</span>
+            <input id="custom-model" type="text" list="custom-model-list" spellcheck="false" placeholder="gpt-5.5" />
+            <datalist id="custom-model-list"></datalist>
+          </label>
+          <label class="field">
+            <span>模型目录路径</span><span class="field-note">只能是同源相对路径</span>
+            <input id="custom-models-path" type="text" spellcheck="false" placeholder="/models" />
+          </label>
+          <label class="field">
+            <span>额度接口路径</span><span class="field-note">可留空；不同网关没有统一标准</span>
+            <input id="custom-quota-path" type="text" spellcheck="false" placeholder="/account/quota" />
+          </label>
+          <details class="mapping-details full-field">
+            <summary>额度 JSON 字段映射（可选）</summary>
+            <div class="mapping-grid">
+              <label class="field"><span>总额度</span><input id="quota-total-field" type="text" placeholder="data.credits.total" /></label>
+              <label class="field"><span>已用</span><input id="quota-used-field" type="text" placeholder="data.credits.used" /></label>
+              <label class="field"><span>剩余</span><input id="quota-remaining-field" type="text" placeholder="data.credits.remaining" /></label>
+              <label class="field"><span>重置时间</span><input id="quota-reset-field" type="text" placeholder="data.reset_at" /></label>
+              <label class="field"><span>单位</span><input id="quota-unit" type="text" placeholder="credits" /></label>
+            </div>
+          </details>
+        </div>
+        <div class="panel-actions">
+          <p>密钥写入 0600 本机配置；环境变量优先，所有接口路径固定同源。</p>
+          <button class="primary-button" id="save-custom" type="button">应用第三方配置</button>
+        </div>
+      </section>
+
+      <section class="panel codex-panel">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">CODEX CONFIG TAKEOVER</p>
+            <h2>Codex 配置接管</h2>
+          </div>
+          <span class="status-badge" id="codex-config-status">未接管</span>
+        </div>
+        <div class="takeover-grid">
+          <div class="takeover-copy">
+            <p>启用前先创建带时间戳的完整备份，再在当前 config.toml 上仅接管模型连接字段；默认 OpenAI 配置会切换到专用 Switchboard Provider，避免 Codex 误判其支持原生远程压缩。</p>
+            <dl class="path-list">
+              <div><dt>目标配置</dt><dd id="codex-config-path">—</dd></div>
+              <div><dt>最近备份</dt><dd id="codex-backup-path">—</dd></div>
+              <div><dt>轮转日志</dt><dd id="switchboard-log-path">—</dd></div>
+              <div><dt>安全状态</dt><dd id="codex-config-integrity">等待检查</dd></div>
+            </dl>
+          </div>
+          <div class="confirm-box">
+            <label class="field">
+              <span>操作确认</span>
+              <span class="field-note">启用输入 ENABLE；关闭并恢复输入 RESTORE</span>
+              <input id="codex-confirmation" type="text" autocomplete="off" spellcheck="false" placeholder="ENABLE / RESTORE" />
+            </label>
+            <div class="inline-buttons">
+              <button class="primary-button" id="enable-codex-config" type="button">备份并启用代理</button>
+              <button class="danger-button" id="disable-codex-config" type="button">关闭代理</button>
+            </div>
+          </div>
+        </div>
+        <p class="warning-copy">关闭时只校验并恢复 Switchboard 接管的字段；Codex 自动更新的插件、市场、桌面字段以及你的其他编辑都会保留。</p>
+      </section>
+
+      <section class="panel inspector-panel">
+        <div class="panel-heading">
+          <div><p class="eyebrow">LIVE INSPECTOR</p><h2>最近一次上游请求</h2></div>
+          <span class="live-badge"><span></span>自动刷新</span>
+        </div>
+        <div class="inspector-grid" id="last-request">
+          <div><span>厂家</span><strong>尚无请求</strong></div>
+          <div><span>动作</span><strong>—</strong></div>
+          <div><span>模型</span><strong>—</strong></div>
+          <div><span>会话复用</span><strong>—</strong></div>
+        </div>
+        <div class="request-params">
+          <span>实际参数</span>
+          <div class="param-list" id="last-params"><span class="empty-chip">等待首个请求</span></div>
+        </div>
+      </section>
+
+      <footer>
+        <span>Codex Provider Switchboard <strong id="version">—</strong></span>
+        <span>默认仅监听本机回环地址 · 密钥永不回显</span>
+      </footer>
+    </main>
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  </body>
+</html>

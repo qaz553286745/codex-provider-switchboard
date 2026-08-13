@@ -1,0 +1,32 @@
+# Safe demo only. Copy the parts you need into the user-level
+# ~/.codex/config.toml. Never commit a real API key.
+
+model_provider = "codex-provider-switchboard"
+model = "gpt-5.6-sol"
+model_reasoning_effort = "max"
+
+# Local switchboard: choose Kiro, Cursor, or a third-party API in the web UI.
+[model_providers.codex-provider-switchboard]
+name = "Local Codex Provider Switchboard"
+base_url = "http://127.0.0.1:8787/v1"
+wire_api = "responses"
+requires_openai_auth = false
+supports_websockets = true
+request_max_retries = 0
+stream_max_retries = 0
+
+# If SWITCHBOARD_TOKEN protects the local service, uncomment this line.
+# env_key = "SWITCHBOARD_TOKEN"
+
+# Optional direct third-party setup that bypasses the local switchboard.
+# Change model_provider above to "third-party" to use it.
+[model_providers.third-party]
+name = "Third-party Responses API"
+base_url = "https://api.example.com/v1"
+wire_api = "responses"
+env_key = "THIRD_PARTY_API_KEY"
+requires_openai_auth = false
+supports_websockets = false
+request_max_retries = 4
+stream_max_retries = 5
+stream_idle_timeout_ms = 300000

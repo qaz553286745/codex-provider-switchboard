@@ -1,0 +1,37 @@
+{
+  "version": 4,
+  "active_provider": "kiro",
+  "kiro": {
+    "model_id": "gpt-5.6-sol"
+  },
+  "cursor": {
+    "backend": "cli",
+    "api_key": "",
+    "base_url": "https://api.cursor.com",
+    "model_id": "",
+    "model_params": [],
+    "model_display_name": "Cursor default",
+    "follow_codex_effort": true,
+    "timeout_seconds": 1800
+  },
+  "custom": {
+    "api_key": "",
+    "base_url": "https://api.example.com/v1",
+    "model_id": "gpt-5.5",
+    "model_display_name": "GPT 5.5",
+    "models_path": "/models",
+    "quota_path": "",
+    "quota_total_field": "",
+    "quota_used_field": "",
+    "quota_remaining_field": "",
+    "quota_reset_field": "",
+    "quota_unit": "credits",
+    "timeout_seconds": 300
+  },
+  "direct": {
+    "platform_id": "openai_codex",
+    "model_id": "gpt-5.6-sol",
+    "follow_codex_effort": true,
+    "timeout_seconds": 600
+  }
+}

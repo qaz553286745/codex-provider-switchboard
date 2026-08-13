@@ -1,0 +1,16 @@
+# Merge this into the user-level ~/.codex/config.toml.
+# Provider routing is intentionally ignored in project-local .codex/config.toml.
+model = "gpt-5.6-sol"
+model_provider = "codex-provider-switchboard"
+
+[model_providers.codex-provider-switchboard]
+name = "Local provider switchboard"
+base_url = "http://127.0.0.1:8787/v1"
+wire_api = "responses"
+requires_openai_auth = false
+supports_websockets = true
+request_max_retries = 0
+stream_max_retries = 0
+
+# For a token-protected deployment, pass the token through the environment:
+# env_key = "SWITCHBOARD_TOKEN"

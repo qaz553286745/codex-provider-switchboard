@@ -23,11 +23,11 @@ classifiers = [
 
 urls = { Homepage = "https://github.com/qaz553286745/codex-provider-switchboard", Repository = "https://github.com/qaz553286745/codex-provider-switchboard", Issues = "https://github.com/qaz553286745/codex-provider-switchboard/issues", Changelog = "https://github.com/qaz553286745/codex-provider-switchboard/blob/main/CHANGELOG.md" }
 dependencies = [
-    "fastapi==0.139.0",
+    "fastapi==0.141.1",
     "httpx==0.28.1",
     "tomlkit==0.15.1",
-    "uvicorn==0.51.0",
-    "websockets==16.1.1",
+    "uvicorn==0.52.1",
+    "websockets==17.0.1",
     "zstandard==0.25.0",
 ]
 
@@ -37,12 +37,12 @@ codex-provider-switchboard = "codex_provider_switchboard.cli:main"
 [dependency-groups]
 dev = [
     "build==1.5.0",
-    "httpx2==2.9.0",
-    "pre-commit==4.6.0",
+    "httpx2==2.10.0",
+    "pre-commit==4.6.1",
     "pytest==9.1.1",
     "pytest-cov==7.1.0",
-    "ruff==0.15.22",
-    "twine==6.2.0",
+    "ruff==0.16.2",
+    "twine==7.0.0",
 ]
 
 [build-system]

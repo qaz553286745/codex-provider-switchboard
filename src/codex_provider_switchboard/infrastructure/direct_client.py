@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import re
 import struct
 import time
@@ -35,6 +36,10 @@ _KIRO_API_REGION_MAP = {
     "eu-central-2": "eu-central-1",
 }
 _KIRO_APPLICATION_VERSION = "1.28.3"
+_KIRO_GENERATION_MAX_ATTEMPTS = 2
+_KIRO_RETRY_DELAY_SECONDS = 0.25
+
+logger = logging.getLogger(__name__)
 
 
 def _kiro_generation_headers(access_token: str) -> dict[str, str]:
@@ -591,37 +596,61 @@ class DirectClient:
         )
         if profile_arn:
             payload = {**payload, "profileArn": profile_arn}
-        decoder = _KiroEventDecoder()
-        stream_bytes = 0
         saw_event = False
         async with self._semaphore:
-            try:
-                async with (
-                    self._client(base_url, timeout_seconds) as client,
-                    client.stream(
-                        "POST",
-                        platform.response_path,
-                        headers=_kiro_generation_headers(credential.token),
-                        json=payload,
-                    ) as response,
-                ):
-                    if response.status_code >= 400:
-                        raw = await self._read_limited(response)
-                        raise self._error(response.status_code, raw, platform.name)
-                    async for chunk in response.aiter_bytes():
-                        stream_bytes += len(chunk)
-                        if stream_bytes > self.settings.direct_max_output_bytes:
-                            raise DirectAPIError("Kiro stream exceeded the byte limit.")
-                        for event in decoder.feed(chunk):
-                            saw_event = True
-                            yield event
-                    decoder.finish()
-            except DirectAPIError:
-                raise
-            except httpx.HTTPError as exc:
-                raise DirectAPIError(
-                    f"Kiro direct request failed ({type(exc).__name__})."
-                ) from exc
+            for attempt in range(1, _KIRO_GENERATION_MAX_ATTEMPTS + 1):
+                decoder = _KiroEventDecoder()
+                stream_bytes = 0
+                try:
+                    async with (
+                        self._client(base_url, timeout_seconds) as client,
+                        client.stream(
+                            "POST",
+                            platform.response_path,
+                            headers=_kiro_generation_headers(credential.token),
+                            json=payload,
+                        ) as response,
+                    ):
+                        if response.status_code >= 400:
+                            raw = await self._read_limited(response)
+                            retryable = response.status_code == 429 or (
+                                500 <= response.status_code <= 599
+                            )
+                            will_retry = (
+                                retryable
+                                and not saw_event
+                                and attempt < _KIRO_GENERATION_MAX_ATTEMPTS
+                            )
+                            log = logger.warning if will_retry else logger.error
+                            log(
+                                "Kiro Direct upstream HTTP failure status=%d "
+                                "attempt=%d max_attempts=%d retry=%s",
+                                response.status_code,
+                                attempt,
+                                _KIRO_GENERATION_MAX_ATTEMPTS,
+                                will_retry,
+                            )
+                            if will_retry:
+                                await asyncio.sleep(_KIRO_RETRY_DELAY_SECONDS)
+                                continue
+                            raise self._error(response.status_code, raw, platform.name)
+                        async for chunk in response.aiter_bytes():
+                            stream_bytes += len(chunk)
+                            if stream_bytes > self.settings.direct_max_output_bytes:
+                                raise DirectAPIError(
+                                    "Kiro stream exceeded the byte limit."
+                                )
+                            for event in decoder.feed(chunk):
+                                saw_event = True
+                                yield event
+                        decoder.finish()
+                        break
+                except DirectAPIError:
+                    raise
+                except httpx.HTTPError as exc:
+                    raise DirectAPIError(
+                        f"Kiro direct request failed ({type(exc).__name__})."
+                    ) from exc
         if not saw_event:
             raise DirectAPIError("Kiro stream ended without any events.")
 

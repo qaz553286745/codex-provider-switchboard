@@ -190,6 +190,102 @@ def test_kiro_direct_matches_pi_application_request_contract(tmp_path) -> None:
     )
 
 
+def test_kiro_direct_retries_one_transient_http_failure(tmp_path) -> None:
+    generation_attempts = 0
+    invocation_ids: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal generation_attempts
+        if request.url.path == "/":
+            return httpx.Response(200, json={"profiles": []})
+        generation_attempts += 1
+        invocation_ids.append(request.headers["amz-sdk-invocation-id"])
+        if generation_attempts == 1:
+            return httpx.Response(
+                500,
+                json={
+                    "message": (
+                        "Encountered an unexpected error when processing the "
+                        "request, please try again."
+                    )
+                },
+            )
+        return httpx.Response(
+            200,
+            headers={"content-type": "application/json"},
+            content=_event_frame({"content": "recovered"}),
+        )
+
+    settings = _settings(tmp_path)
+    store = ConfigStore(tmp_path / "config.json")
+    store.update_from_api(
+        {"direct": {"platform_id": "kiro_direct", "model_id": "gpt-5.6-sol"}}
+    )
+    credentials = CredentialStore(tmp_path / "credentials.json")
+    credentials.set_oauth(
+        "kiro_direct",
+        access="kiro-access",
+        refresh="kiro-refresh",
+        expires_at=4_102_444_800_000,
+        extra={"region": "us-east-1"},
+    )
+    transport = httpx.MockTransport(handler)
+    client = DirectClient(
+        settings,
+        store,
+        OAuthLoginManager(settings, credentials, transport=transport),
+        transport=transport,
+    )
+
+    async def scenario() -> list[dict[str, Any]]:
+        return [event async for event in client.stream_kiro({"conversationState": {}})]
+
+    events = asyncio.run(scenario())
+    assert events[0]["content"] == "recovered"
+    assert generation_attempts == 2
+    assert len(set(invocation_ids)) == 2
+
+
+def test_kiro_direct_does_not_retry_permanent_http_failure(tmp_path) -> None:
+    generation_attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal generation_attempts
+        if request.url.path == "/":
+            return httpx.Response(200, json={"profiles": []})
+        generation_attempts += 1
+        return httpx.Response(400, json={"message": "Invalid request."})
+
+    settings = _settings(tmp_path)
+    store = ConfigStore(tmp_path / "config.json")
+    store.update_from_api(
+        {"direct": {"platform_id": "kiro_direct", "model_id": "gpt-5.6-sol"}}
+    )
+    credentials = CredentialStore(tmp_path / "credentials.json")
+    credentials.set_oauth(
+        "kiro_direct",
+        access="kiro-access",
+        refresh="kiro-refresh",
+        expires_at=4_102_444_800_000,
+        extra={"region": "us-east-1"},
+    )
+    transport = httpx.MockTransport(handler)
+    client = DirectClient(
+        settings,
+        store,
+        OAuthLoginManager(settings, credentials, transport=transport),
+        transport=transport,
+    )
+
+    async def scenario() -> None:
+        with pytest.raises(DirectAPIError, match="Invalid request"):
+            async for _ in client.stream_kiro({"conversationState": {}}):
+                pass
+
+    asyncio.run(scenario())
+    assert generation_attempts == 1
+
+
 def test_openai_direct_client_uses_native_http_and_complete_sse_frames(
     monkeypatch, tmp_path
 ) -> None:

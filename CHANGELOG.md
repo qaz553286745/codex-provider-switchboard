@@ -6,6 +6,15 @@ All notable changes are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-08-14
+
+### Fixed
+
+- Kiro Direct retries one rate-limit or upstream 5xx response before any stream
+  event is emitted, using a fresh invocation ID and bounded delay; permanent
+  4xx failures remain fail-fast and operational logs record only status,
+  attempt, and retry decision.
+
 ## [0.2.0] - 2026-08-13
 
 ### Added

@@ -1,22 +1,18 @@
 from __future__ import annotations
 
-import asyncio
 import hmac
 import ipaddress
 import json
 import logging
-import os
-import re
 import zlib
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
 import zstandard
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import (
     FileResponse,
     HTMLResponse,
@@ -26,125 +22,20 @@ from fastapi.responses import (
 from fastapi.staticfiles import StaticFiles
 
 from .. import __version__
-from ..domain.bridge import response_object
+from ..compatibility.responses import bind_transport_context
 from ..infrastructure.codex_config import CodexConfigError
 from ..providers.base import ProviderError
 from ..runtime import Runtime, build_runtime
+from .responses_transport import (
+    PayloadError,
+    guarded_responses_sse,
+    run_responses_websocket,
+    validate_responses_body,
+)
 
 logger = logging.getLogger(__name__)
 STATIC_DIR = Path(__file__).with_name("static")
 SSE_HEARTBEAT_SECONDS = 15.0
-
-
-class PayloadError(ValueError):
-    def __init__(self, message: str, *, status_code: int = 400) -> None:
-        super().__init__(message)
-        self.status_code = status_code
-
-
-class _SSEJSONDecoder:
-    """Decode complete JSON SSE records without exposing partial upstream data."""
-
-    _separator = re.compile(rb"\r?\n\r?\n")
-
-    def __init__(self, limit: int) -> None:
-        self._buffer = bytearray()
-        self._limit = limit
-
-    def feed(self, chunk: bytes) -> list[dict[str, Any]]:
-        self._buffer.extend(chunk)
-        if len(self._buffer) > self._limit:
-            raise PayloadError("Upstream stream event is too large.", status_code=502)
-        events: list[dict[str, Any]] = []
-        while match := self._separator.search(self._buffer):
-            block = bytes(self._buffer[: match.start()])
-            del self._buffer[: match.end()]
-            event = self._decode_block(block)
-            if event is not None:
-                events.append(event)
-        return events
-
-    def finish(self) -> None:
-        if self._buffer.strip():
-            raise PayloadError(
-                "Upstream stream ended with an incomplete event.", status_code=502
-            )
-
-    @staticmethod
-    def _decode_block(block: bytes) -> dict[str, Any] | None:
-        try:
-            lines = block.decode("utf-8").splitlines()
-        except UnicodeDecodeError as exc:
-            raise PayloadError(
-                "Upstream stream was not valid UTF-8.", status_code=502
-            ) from exc
-        data_lines: list[str] = []
-        for line in lines:
-            if line.startswith("data:"):
-                value = line[5:]
-                data_lines.append(value[1:] if value.startswith(" ") else value)
-        if not data_lines:
-            return None
-        data = "\n".join(data_lines)
-        if data == "[DONE]":
-            return None
-        try:
-            event = json.loads(data)
-        except (json.JSONDecodeError, RecursionError) as exc:
-            raise PayloadError(
-                "Upstream stream event was not valid JSON.", status_code=502
-            ) from exc
-        if not isinstance(event, dict) or not isinstance(event.get("type"), str):
-            raise PayloadError(
-                "Upstream stream event has an invalid shape.", status_code=502
-            )
-        return event
-
-
-@dataclass(frozen=True, slots=True)
-class _WebSocketResponseState:
-    """Connection-local state for one Responses WebSocket continuation."""
-
-    response_id: str
-    request: dict[str, Any]
-    output: list[Any]
-
-
-async def _cancel_task(task: asyncio.Task[Any]) -> None:
-    if not task.done():
-        task.cancel()
-    await asyncio.gather(task, return_exceptions=True)
-
-
-async def _with_sse_heartbeat(
-    iterator: AsyncIterator[bytes],
-    *,
-    interval_seconds: float = SSE_HEARTBEAT_SECONDS,
-) -> AsyncIterator[bytes]:
-    """Keep an otherwise silent SSE stream alive without inventing API events."""
-
-    upstream = aiter(iterator)
-    pending: asyncio.Task[bytes] | None = None
-    try:
-        while True:
-            if pending is None:
-                pending = asyncio.create_task(anext(upstream))
-            done, _ = await asyncio.wait({pending}, timeout=interval_seconds)
-            if not done:
-                yield b": keep-alive\n\n"
-                continue
-            try:
-                chunk = pending.result()
-            except StopAsyncIteration:
-                return
-            pending = None
-            yield chunk
-    finally:
-        if pending is not None:
-            await _cancel_task(pending)
-        close = getattr(upstream, "aclose", None)
-        if close is not None:
-            await close()
 
 
 def _is_loopback(value: str | None) -> bool:
@@ -295,149 +186,6 @@ def _decode_content_encoding(
             raise PayloadError("Request body compression is invalid.")
         return bytes(decoded)
     raise PayloadError(f"Unsupported Content-Encoding: {encoding}.", status_code=415)
-
-
-async def _websocket_json_body(websocket: WebSocket, limit: int) -> dict[str, Any]:
-    message = await websocket.receive()
-    if message["type"] == "websocket.disconnect":
-        raise WebSocketDisconnect(message.get("code", 1000))
-    text = message.get("text")
-    if not isinstance(text, str):
-        raise PayloadError("WebSocket requests must be JSON text frames.")
-    if len(text.encode("utf-8")) > limit:
-        raise PayloadError("Request body is too large.", status_code=413)
-
-    def reject_constant(value: str) -> None:
-        raise ValueError(f"Invalid JSON constant: {value}")
-
-    try:
-        payload = json.loads(text, parse_constant=reject_constant)
-    except (json.JSONDecodeError, RecursionError, ValueError) as exc:
-        raise PayloadError("Request body must be valid JSON.") from exc
-    if not isinstance(payload, dict):
-        raise PayloadError("Request body must be a JSON object.")
-    return payload
-
-
-async def _send_websocket_error(
-    websocket: WebSocket,
-    message: str,
-    error_type: str,
-    *,
-    status_code: int,
-    code: str | None = None,
-    param: str | None = None,
-) -> None:
-    await websocket.send_json(
-        {
-            "type": "error",
-            "status": status_code,
-            "error": {
-                "message": message,
-                "type": error_type,
-                "param": param,
-                "code": code,
-            },
-        }
-    )
-
-
-async def _send_websocket_prewarm(
-    websocket: WebSocket,
-    body: dict[str, Any],
-) -> str:
-    response_id = f"resp_{os.urandom(16).hex()}"
-    model_value = body.get("model")
-    model = model_value if isinstance(model_value, str) else "unknown"
-    response_body = {"model": model}
-    created = response_object(
-        response_body, model, response_id, "in_progress", [], None
-    )
-    completed = response_object(
-        response_body,
-        model,
-        response_id,
-        "completed",
-        [],
-        {
-            "input_tokens": 0,
-            "input_tokens_details": {"cached_tokens": 0},
-            "output_tokens": 0,
-            "output_tokens_details": {"reasoning_tokens": 0},
-            "total_tokens": 0,
-        },
-    )
-    completed["created_at"] = created["created_at"]
-    await websocket.send_json(
-        {
-            "type": "response.created",
-            "sequence_number": 0,
-            "response": created,
-        }
-    )
-    await websocket.send_json(
-        {
-            "type": "response.completed",
-            "sequence_number": 1,
-            "response": completed,
-        }
-    )
-    return response_id
-
-
-def _input_items(value: Any) -> list[Any]:
-    if value in (None, "", []):
-        return []
-    if isinstance(value, list):
-        return list(value)
-    return [value]
-
-
-def _restore_websocket_continuation(
-    previous: _WebSocketResponseState,
-    current: dict[str, Any],
-) -> dict[str, Any]:
-    """Rebuild the logical request represented by an incremental WS turn."""
-    restored = {**previous.request, **current}
-    restored["input"] = [
-        *_input_items(previous.request.get("input")),
-        *previous.output,
-        *_input_items(current.get("input")),
-    ]
-    for key in ("instructions", "tools"):
-        if current.get(key) in (None, "", []) and key in previous.request:
-            restored[key] = previous.request[key]
-    restored.pop("generate", None)
-    return restored
-
-
-def _validate_responses_body(body: dict[str, Any]) -> None:
-    input_value = body.get("input")
-    if isinstance(input_value, list) and len(input_value) > 10_000:
-        raise PayloadError("input contains too many items.")
-    tools = body.get("tools")
-    if tools is not None:
-        if not isinstance(tools, list):
-            raise PayloadError("tools must be an array.")
-        if len(tools) > 512:
-            raise PayloadError("tools contains too many items.")
-    metadata = body.get("client_metadata")
-    if metadata is not None and not isinstance(metadata, dict):
-        raise PayloadError("client_metadata must be an object.")
-
-
-def _validate_reconstructed_body(body: dict[str, Any], limit: int) -> None:
-    _validate_responses_body(body)
-    try:
-        size = len(
-            json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        )
-    except (TypeError, ValueError, RecursionError) as exc:
-        raise PayloadError("Reconstructed WebSocket request is invalid.") from exc
-    if size > limit:
-        raise PayloadError(
-            "Reconstructed WebSocket request is too large.", status_code=413
-        )
 
 
 def create_app(runtime: Runtime | None = None) -> FastAPI:
@@ -599,6 +347,31 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         if not authorized(request):
             return _error(401, "Control request was rejected.", "authentication_error")
         return JSONResponse({"platforms": service.direct_platforms()})
+
+    @app.get("/api/control/imports/pi")
+    async def preview_pi_credentials(request: Request) -> JSONResponse:
+        if not authorized(request):
+            return _error(401, "Control request was rejected.", "authentication_error")
+        try:
+            preview = service.preview_pi_credentials()
+        except ProviderError as exc:
+            return _error(exc.status_code, str(exc), exc.error_type)
+        return JSONResponse(preview)
+
+    @app.post("/api/control/imports/pi")
+    async def import_pi_credentials(request: Request) -> JSONResponse:
+        if not control_allowed(request):
+            return _error(403, "Control request was rejected.", "authentication_error")
+        try:
+            payload = await _json_body(request, settings.max_request_bytes)
+            result = await service.import_pi_credentials(payload)
+        except PayloadError as exc:
+            return _error(exc.status_code, str(exc), "invalid_request_error")
+        except ValueError as exc:
+            return _error(400, str(exc), "invalid_request_error")
+        except ProviderError as exc:
+            return _error(exc.status_code, str(exc), exc.error_type)
+        return JSONResponse(result)
 
     @app.get("/api/control/direct/models")
     async def direct_models(request: Request) -> JSONResponse:
@@ -821,6 +594,21 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
             return _error(400, str(exc), "invalid_request_error")
         return JSONResponse(status)
 
+    @app.post("/api/control/codex-config/agents")
+    async def configure_codex_agents(request: Request) -> JSONResponse:
+        if not control_allowed(request):
+            return _error(403, "Control request was rejected.", "authentication_error")
+        try:
+            payload = await _json_body(request, settings.max_request_bytes)
+            status = service.configure_codex_agents(payload)
+        except PayloadError as exc:
+            return _error(exc.status_code, str(exc), "invalid_request_error")
+        except CodexConfigError as exc:
+            return _error(exc.status_code, str(exc), "codex_config_error")
+        except (ValueError, OSError) as exc:
+            return _error(400, str(exc), "invalid_request_error")
+        return JSONResponse(status)
+
     @app.get("/health")
     async def health(request: Request) -> JSONResponse:
         if not authorized(request):
@@ -833,13 +621,32 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
             return _error(401, "Invalid proxy token.", "authentication_error")
         return JSONResponse(service.models())
 
+    @app.post("/v1/responses/compact")
+    async def compact_response(request: Request):
+        if not authorized(request):
+            return _error(401, "Invalid proxy token.", "authentication_error")
+        try:
+            body = await _json_body(request, settings.max_request_bytes)
+            body = bind_transport_context(body, request.headers)
+            validate_responses_body(body)
+            provider_response = await service.compact(body)
+        except PayloadError as exc:
+            return _error(exc.status_code, str(exc), "invalid_request_error")
+        except ProviderError as exc:
+            return _error(exc.status_code, str(exc), exc.error_type)
+        return JSONResponse(
+            provider_response.body,
+            headers=provider_response.headers,
+        )
+
     @app.post("/v1/responses")
     async def create_response(request: Request):
         if not authorized(request):
             return _error(401, "Invalid proxy token.", "authentication_error")
         try:
             body = await _json_body(request, settings.max_request_bytes)
-            _validate_responses_body(body)
+            body = bind_transport_context(body, request.headers)
+            validate_responses_body(body)
         except PayloadError as exc:
             return _error(exc.status_code, str(exc), "invalid_request_error")
         if "input" not in body:
@@ -848,8 +655,18 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         try:
             if body.get("stream") is True:
                 provider_id, iterator = service.stream(body)
+                event_limit = max(
+                    settings.max_request_bytes,
+                    settings.kiro_max_output_bytes,
+                    settings.cursor_max_output_bytes,
+                    settings.direct_max_output_bytes,
+                )
                 return StreamingResponse(
-                    _with_sse_heartbeat(iterator),
+                    guarded_responses_sse(
+                        iterator,
+                        event_limit=event_limit,
+                        heartbeat_seconds=SSE_HEARTBEAT_SECONDS,
+                    ),
                     media_type="text/event-stream",
                     headers={
                         "Cache-Control": "no-cache",
@@ -871,249 +688,6 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
             await websocket.close(code=1008, reason="Request was rejected.")
             return
         await websocket.accept()
-        stream_event_limit = max(
-            settings.max_request_bytes,
-            settings.kiro_max_output_bytes,
-            settings.cursor_max_output_bytes,
-            settings.direct_max_output_bytes,
-        )
-        previous_response: _WebSocketResponseState | None = None
-        pending_body: dict[str, Any] | None = None
-        pending_receive_task: asyncio.Task[dict[str, Any]] | None = None
-        while True:
-            if pending_body is None:
-                try:
-                    if pending_receive_task is None:
-                        body = await _websocket_json_body(
-                            websocket, settings.max_request_bytes
-                        )
-                    else:
-                        receive_task = pending_receive_task
-                        pending_receive_task = None
-                        body = await receive_task
-                except WebSocketDisconnect:
-                    return
-                except PayloadError as exc:
-                    await _send_websocket_error(
-                        websocket,
-                        str(exc),
-                        "invalid_request_error",
-                        status_code=exc.status_code,
-                    )
-                    continue
-            else:
-                body = pending_body
-                pending_body = None
-
-            event_type = body.pop("type", None)
-            if event_type == "response.cancel":
-                logger.info("Ignoring response.cancel with no active response")
-                continue
-            if event_type != "response.create":
-                await _send_websocket_error(
-                    websocket,
-                    "Unsupported WebSocket event type.",
-                    "invalid_request_error",
-                    status_code=400,
-                    code="invalid_event",
-                )
-                continue
-            body["stream"] = True
-            prewarm_only = body.get("generate") is False
-            try:
-                _validate_responses_body(body)
-            except PayloadError as exc:
-                await _send_websocket_error(
-                    websocket,
-                    str(exc),
-                    "invalid_request_error",
-                    status_code=exc.status_code,
-                )
-                continue
-            previous_response_id = body.get("previous_response_id")
-            continued = False
-            if isinstance(previous_response_id, str):
-                if (
-                    previous_response is None
-                    or previous_response.response_id != previous_response_id
-                ):
-                    await _send_websocket_error(
-                        websocket,
-                        (
-                            f"Previous response with id '{previous_response_id}' "
-                            "was not found."
-                        ),
-                        "invalid_request_error",
-                        status_code=400,
-                        code="previous_response_not_found",
-                        param="previous_response_id",
-                    )
-                    continue
-                body = _restore_websocket_continuation(previous_response, body)
-                continued = True
-                try:
-                    _validate_reconstructed_body(body, settings.max_request_bytes)
-                except PayloadError as exc:
-                    previous_response = None
-                    await _send_websocket_error(
-                        websocket,
-                        str(exc),
-                        "invalid_request_error",
-                        status_code=exc.status_code,
-                    )
-                    continue
-            if prewarm_only:
-                response_id = await _send_websocket_prewarm(websocket, body)
-                previous_response = _WebSocketResponseState(
-                    response_id=response_id,
-                    request={
-                        key: value for key, value in body.items() if key != "generate"
-                    },
-                    output=[],
-                )
-                continue
-            if "input" not in body:
-                await _send_websocket_error(
-                    websocket,
-                    "Missing required field: input",
-                    "invalid_request_error",
-                    status_code=400,
-                )
-                continue
-
-            async def forward_active_response(
-                request_body: dict[str, Any] = body,
-            ) -> _WebSocketResponseState | None:
-                _provider_id, iterator = service.stream(request_body)
-                decoder = _SSEJSONDecoder(stream_event_limit)
-                completed_state: _WebSocketResponseState | None = None
-                try:
-                    async for chunk in iterator:
-                        for event in decoder.feed(chunk):
-                            if event.get("type") == "response.completed":
-                                response = event.get("response")
-                                if isinstance(response, dict):
-                                    response_id = response.get("id")
-                                    output = response.get("output")
-                                    if isinstance(response_id, str) and isinstance(
-                                        output, list
-                                    ):
-                                        completed_state = _WebSocketResponseState(
-                                            response_id=response_id,
-                                            request=dict(request_body),
-                                            output=list(output),
-                                        )
-                            await websocket.send_text(
-                                json.dumps(
-                                    event,
-                                    ensure_ascii=False,
-                                    separators=(",", ":"),
-                                )
-                            )
-                    decoder.finish()
-                    return completed_state
-                finally:
-                    close = getattr(iterator, "aclose", None)
-                    if callable(close):
-                        await close()
-
-            stream_task = asyncio.create_task(
-                forward_active_response(), name="switchboard-websocket-response"
-            )
-            while True:
-                receive_task = asyncio.create_task(
-                    _websocket_json_body(websocket, settings.max_request_bytes),
-                    name="switchboard-websocket-control",
-                )
-                done, _pending = await asyncio.wait(
-                    {stream_task, receive_task},
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-
-                if stream_task in done:
-                    if receive_task in done:
-                        try:
-                            pending_body = receive_task.result()
-                        except WebSocketDisconnect:
-                            return
-                        except PayloadError as exc:
-                            await _send_websocket_error(
-                                websocket,
-                                str(exc),
-                                "invalid_request_error",
-                                status_code=exc.status_code,
-                            )
-                    else:
-                        # Keep the already-started receive alive for the next
-                        # outer iteration. Cancelling it here can consume and
-                        # discard a response.create sent immediately after the
-                        # client observes response.completed.
-                        pending_receive_task = receive_task
-                    try:
-                        completed_state = stream_task.result()
-                    except WebSocketDisconnect:
-                        return
-                    except ProviderError as exc:
-                        if continued:
-                            previous_response = None
-                        await _send_websocket_error(
-                            websocket,
-                            str(exc),
-                            exc.error_type,
-                            status_code=exc.status_code,
-                        )
-                        completed_state = None
-                    except PayloadError as exc:
-                        if continued:
-                            previous_response = None
-                        await _send_websocket_error(
-                            websocket,
-                            str(exc),
-                            "upstream_protocol_error",
-                            status_code=exc.status_code,
-                        )
-                        completed_state = None
-                    if completed_state is not None:
-                        previous_response = completed_state
-                    elif continued:
-                        previous_response = None
-                    break
-
-                try:
-                    incoming = receive_task.result()
-                except WebSocketDisconnect:
-                    logger.info("WebSocket disconnected; cancelling active response")
-                    await _cancel_task(stream_task)
-                    return
-                except PayloadError as exc:
-                    await _send_websocket_error(
-                        websocket,
-                        str(exc),
-                        "invalid_request_error",
-                        status_code=exc.status_code,
-                    )
-                    continue
-
-                incoming_type = incoming.get("type")
-                if incoming_type not in {"response.cancel", "response.create"}:
-                    await _send_websocket_error(
-                        websocket,
-                        "Unsupported WebSocket event type.",
-                        "invalid_request_error",
-                        status_code=400,
-                        code="invalid_event",
-                    )
-                    continue
-
-                reason = (
-                    "client_cancel"
-                    if incoming_type == "response.cancel"
-                    else "superseded_by_response_create"
-                )
-                logger.info("Cancelling active WebSocket response reason=%s", reason)
-                await _cancel_task(stream_task)
-                if incoming_type == "response.create":
-                    pending_body = incoming
-                break
+        await run_responses_websocket(websocket, service, settings)
 
     return app

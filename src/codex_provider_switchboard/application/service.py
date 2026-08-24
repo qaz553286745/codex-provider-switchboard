@@ -3,12 +3,22 @@ from __future__ import annotations
 import json
 import logging
 import shutil
+import uuid
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from typing import Any
 
 from .. import __version__
-from ..domain.bridge import request_summary
+from ..compatibility.profiles import ProviderCapabilities, compatibility_profile
+from ..domain.agent_loop_guard import AgentControlLoop, detect_agent_control_loop
+from ..domain.bridge import (
+    BridgeResult,
+    encode_sse,
+    output_items,
+    request_summary,
+    response_object,
+    streaming_events,
+)
 from ..infrastructure.codex_config import CodexConfigManager
 from ..infrastructure.config_store import PROVIDER_IDS, ConfigStore
 from ..infrastructure.credential_store import CredentialStore, CredentialStoreError
@@ -18,6 +28,12 @@ from ..infrastructure.direct_catalog import direct_platform, direct_platform_cat
 from ..infrastructure.direct_client import DirectAPIError, DirectClient
 from ..infrastructure.kiro_cli import KiroInvocationError, KiroRunner
 from ..infrastructure.oauth import OAuthError, OAuthLoginManager
+from ..infrastructure.pi_credentials import (
+    PiCredentialCandidate,
+    PiCredentialImporter,
+    PiCredentialImportError,
+    PiCredentialScan,
+)
 from ..providers.base import ProviderError, ProviderResponse, ResponsesProvider
 from ..providers.cursor import CursorProvider
 from ..providers.direct import DirectProvider
@@ -39,6 +55,7 @@ class SwitchboardService:
         direct_provider: DirectProvider,
         credentials: CredentialStore,
         oauth: OAuthLoginManager,
+        pi_credentials: PiCredentialImporter,
         codex_config: CodexConfigManager,
         inspector: RequestInspector,
         providers: dict[str, ResponsesProvider],
@@ -55,6 +72,7 @@ class SwitchboardService:
         self.direct_provider = direct_provider
         self.credentials = credentials
         self.oauth = oauth
+        self.pi_credentials = pi_credentials
         self.codex_config = codex_config
         self.inspector = inspector
         self.providers = providers
@@ -66,19 +84,34 @@ class SwitchboardService:
     def active_provider(self) -> ResponsesProvider:
         return self.providers[self.active_provider_id()]
 
-    @staticmethod
-    def _reject_native_remote_compaction(body: dict[str, Any]) -> None:
+    def _provider_capabilities(self, provider_id: str) -> ProviderCapabilities:
+        if provider_id == "direct":
+            platform_id = str(self.store.read()["direct"]["platform_id"])
+            profile_id = direct_platform(platform_id).compatibility_profile
+        elif provider_id == "custom":
+            profile_id = str(
+                self.store.read()["custom"].get("compatibility_profile")
+                or "function_only"
+            )
+        else:
+            profile_id = "prompt_bridge"
+        return compatibility_profile(profile_id)
+
+    def _validate_native_remote_compaction(
+        self, body: dict[str, Any], provider_id: str
+    ) -> None:
         input_value = body.get("input")
         if not isinstance(input_value, list) or not any(
             isinstance(item, dict) and item.get("type") == "compaction_trigger"
             for item in input_value
         ):
             return
+        if self._provider_capabilities(provider_id).native_compaction:
+            return
         logger.warning("Rejected unsupported native remote compaction request")
         raise ProviderError(
-            "Native OpenAI remote compaction is not supported by Switchboard. "
-            "Enable the dedicated codex-provider-switchboard provider and start "
-            "a new Codex task.",
+            "The selected provider cannot execute native Responses compaction. "
+            "Switch to a native Codex-compatible provider or start a new task.",
             error_type="unsupported_feature",
             status_code=400,
         )
@@ -89,6 +122,90 @@ class SwitchboardService:
         summary = request_summary(body)
         summary["provider"] = provider_id
         logger.info("request_metadata=%s", json.dumps(summary, ensure_ascii=True))
+
+    def _agent_loop_decision(
+        self, body: dict[str, Any], provider_id: str
+    ) -> AgentControlLoop | None:
+        if not self.settings.agent_loop_guard:
+            return None
+        multi_agent = body.get("multi_agent")
+        if (
+            self._provider_capabilities(provider_id).native_multi_agent
+            and isinstance(multi_agent, dict)
+            and multi_agent.get("enabled") is True
+        ):
+            return None
+        decision = detect_agent_control_loop(
+            body,
+            restart_limit=self.settings.agent_loop_restart_limit,
+        )
+        if decision is None:
+            return None
+        model = self._guard_model(body, provider_id)
+        self.inspector.record(
+            provider=provider_id,
+            action="agent_control_loop_stopped",
+            model=model,
+            effort=None,
+            session_reused=False,
+        )
+        logger.warning(
+            "Stopped repeated subagent control loop provider=%s reason=%s "
+            "control_calls=%d restart_count=%d target=%s",
+            provider_id,
+            decision.reason,
+            decision.control_calls,
+            decision.restart_count,
+            decision.target_digest or "none",
+        )
+        return decision
+
+    def _guard_model(self, body: dict[str, Any], provider_id: str) -> str:
+        requested = body.get("model")
+        if isinstance(requested, str) and requested:
+            return requested
+        try:
+            return self.providers[provider_id].model_id()
+        except (KeyError, TypeError, ValueError):
+            return "unknown"
+
+    def _guard_response(
+        self,
+        body: dict[str, Any],
+        provider_id: str,
+        decision: AgentControlLoop,
+    ) -> ProviderResponse:
+        model = self._guard_model(body, provider_id)
+        response = response_object(
+            body,
+            model,
+            f"resp_{uuid.uuid4().hex}",
+            "completed",
+            output_items(BridgeResult(text=decision.user_message)),
+            None,
+        )
+        return ProviderResponse(
+            response,
+            {
+                "X-Switchboard-Provider": provider_id,
+                "X-Switchboard-Guard": "agent-control-loop",
+            },
+        )
+
+    async def _guard_stream(
+        self,
+        body: dict[str, Any],
+        provider_id: str,
+        decision: AgentControlLoop,
+    ) -> AsyncIterator[bytes]:
+        events, _completed = streaming_events(
+            body,
+            self._guard_model(body, provider_id),
+            BridgeResult(text=decision.user_message),
+            "",
+        )
+        for chunk in encode_sse(events):
+            yield chunk
 
     def _ensure_ready(self, provider_id: str) -> None:
         if provider_id == "cursor":
@@ -135,17 +252,74 @@ class SwitchboardService:
 
     async def complete(self, body: dict[str, Any]) -> ProviderResponse:
         provider_id = self.active_provider_id()
-        self._reject_native_remote_compaction(body)
-        self._ensure_ready(provider_id)
+        self._validate_native_remote_compaction(body, provider_id)
         self._log_request(body, provider_id)
+        decision = self._agent_loop_decision(body, provider_id)
+        if decision is not None:
+            return self._guard_response(body, provider_id, decision)
+        self._ensure_ready(provider_id)
         return await self.providers[provider_id].complete(body)
+
+    async def compact(self, body: dict[str, Any]) -> ProviderResponse:
+        provider_id = self.active_provider_id()
+        capabilities = self._provider_capabilities(provider_id)
+        if not capabilities.native_compaction:
+            raise ProviderError(
+                "The selected provider does not support native Responses compaction.",
+                error_type="unsupported_feature",
+                status_code=400,
+            )
+        self._ensure_ready(provider_id)
+        try:
+            if provider_id == "direct":
+                value = await self.direct_client.compact_responses(body)
+                platform_id = str(self.store.read()["direct"]["platform_id"])
+                return ProviderResponse(
+                    value,
+                    {
+                        "X-Switchboard-Provider": provider_id,
+                        "X-Switchboard-Platform": platform_id,
+                    },
+                )
+            if provider_id == "custom":
+                value = await self.custom_client.compact_response(body)
+                return ProviderResponse(value, {"X-Switchboard-Provider": provider_id})
+        except (DirectAPIError, CustomAPIError) as exc:
+            status = exc.status_code
+            raise ProviderError(
+                str(exc),
+                error_type="compaction_error",
+                status_code=(status if isinstance(status, int) else 502),
+            ) from exc
+        raise ProviderError(
+            "The selected provider cannot route native Responses compaction.",
+            error_type="unsupported_feature",
+            status_code=400,
+        )
 
     def stream(self, body: dict[str, Any]) -> tuple[str, AsyncIterator[bytes]]:
         provider_id = self.active_provider_id()
-        self._reject_native_remote_compaction(body)
-        self._ensure_ready(provider_id)
+        return provider_id, self.stream_for(provider_id, body)
+
+    def stream_for(
+        self,
+        provider_id: str,
+        body: dict[str, Any],
+    ) -> AsyncIterator[bytes]:
+        """Start a stream with the provider selected when a request was accepted."""
+        if provider_id not in self.providers:
+            raise ProviderError(
+                "Selected provider is no longer available.",
+                error_type="provider_configuration_error",
+                status_code=503,
+            )
+        self._validate_native_remote_compaction(body, provider_id)
         self._log_request(body, provider_id)
-        return provider_id, self.providers[provider_id].stream(body)
+        decision = self._agent_loop_decision(body, provider_id)
+        if decision is not None:
+            return self._guard_stream(body, provider_id, decision)
+        self._ensure_ready(provider_id)
+        return self.providers[provider_id].stream(body)
 
     @staticmethod
     def safe_model_catalog(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -262,17 +436,148 @@ class SwitchboardService:
         self.oauth.logout(platform_id)
         return self.control_state()
 
+    def _scan_pi_credentials(self) -> PiCredentialScan:
+        try:
+            return self.pi_credentials.scan()
+        except PiCredentialImportError as exc:
+            raise ProviderError(
+                str(exc), error_type="credential_import_error", status_code=400
+            ) from exc
+
+    def preview_pi_credentials(self) -> dict[str, object]:
+        scan = self._scan_pi_credentials()
+        direct_status = self.credentials.safe_status()
+        cursor = self.store.safe_view()["cursor"]
+        candidates: list[dict[str, object]] = []
+        for candidate in scan.candidates:
+            item: dict[str, object] = candidate.safe_view()
+            if candidate.target_kind == "direct":
+                status = direct_status[candidate.target_id]
+                item["configured"] = bool(status["configured"])
+                item["configured_source"] = str(status["source"])
+            else:
+                item["configured"] = bool(cursor["api_key_configured"])
+                item["configured_source"] = str(cursor["api_key_source"])
+            candidates.append(item)
+        return {
+            "source": "pi",
+            "path": "~/.pi/agent/auth.json",
+            "available": True,
+            "candidates": candidates,
+            "unsupported": [dict(item) for item in scan.unsupported],
+        }
+
+    async def _apply_pi_candidate(
+        self, candidate: PiCredentialCandidate, *, replace_existing: bool
+    ) -> str | None:
+        if candidate.target_kind == "cursor":
+            cursor = self.store.safe_view()["cursor"]
+            source = str(cursor["api_key_source"])
+            if source == "environment":
+                return "CURSOR_API_KEY environment override is active"
+            if bool(cursor["api_key_configured"]) and not replace_existing:
+                return "target already has a credential"
+            if candidate.api_key is None:
+                return "Pi Cursor record does not contain a stored API key"
+            self.store.update_from_api({"cursor": {"api_key": candidate.api_key}})
+            return None
+
+        status = self.credentials.safe_status()[candidate.target_id]
+        source = str(status["source"])
+        if source.startswith("env:"):
+            return f"{source} environment override is active"
+        if bool(status["configured"]) and not replace_existing:
+            return "target already has a credential"
+        await self.oauth.cancel_platform_logins(candidate.target_id)
+        if candidate.credential_type == "api_key":
+            if candidate.api_key is None:
+                return "Pi record does not contain a stored API key"
+            self.credentials.set_api_key(candidate.target_id, candidate.api_key)
+            return None
+        if (
+            candidate.access is None
+            or candidate.refresh is None
+            or candidate.expires_at is None
+        ):
+            return "Pi OAuth record is incomplete"
+        self.credentials.set_oauth(
+            candidate.target_id,
+            access=candidate.access,
+            refresh=candidate.refresh,
+            expires_at=candidate.expires_at,
+            extra=candidate.extra,
+        )
+        return None
+
+    async def import_pi_credentials(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if set(payload) - {"replace_existing"}:
+            raise ValueError("Unknown Pi import field.")
+        replace_existing = payload.get("replace_existing", False)
+        if not isinstance(replace_existing, bool):
+            raise ValueError("replace_existing must be a boolean.")
+        scan = self._scan_pi_credentials()
+        imported: list[dict[str, str]] = []
+        skipped: list[dict[str, str]] = []
+        for candidate in scan.candidates:
+            item = candidate.safe_view()
+            try:
+                reason = await self._apply_pi_candidate(
+                    candidate, replace_existing=replace_existing
+                )
+            except (CredentialStoreError, OSError, ValueError):
+                logger.warning(
+                    "Pi credential import failed source=%s target_kind=%s target=%s",
+                    candidate.source_provider,
+                    candidate.target_kind,
+                    candidate.target_id,
+                )
+                skipped.append(
+                    {**item, "reason": "credential could not be stored safely"}
+                )
+                continue
+            if reason is None:
+                imported.append(item)
+            else:
+                skipped.append({**item, "reason": reason})
+        return {
+            "source": "pi",
+            "imported": imported,
+            "skipped": skipped,
+            "unsupported": [dict(item) for item in scan.unsupported],
+            "state": self.control_state(),
+        }
+
     async def import_direct_credentials(
         self, platform_id: str, payload: dict[str, Any]
     ) -> dict[str, Any]:
         if set(payload) != {"source"} or not isinstance(payload.get("source"), str):
             raise ValueError("Credential import requires one string source field.")
-        try:
-            await self.oauth.import_credentials(platform_id, payload["source"])
-        except OAuthError as exc:
+        if platform_id != "kiro_direct" or payload["source"] != "pi":
+            raise ValueError("This credential import source is not supported.")
+        candidate = next(
+            (
+                item
+                for item in self._scan_pi_credentials().candidates
+                if item.target_kind == "direct" and item.target_id == platform_id
+            ),
+            None,
+        )
+        if candidate is None:
             raise ProviderError(
-                str(exc), error_type="direct_auth_error", status_code=400
+                "Pi does not contain an importable Kiro credential.",
+                error_type="direct_auth_error",
+                status_code=400,
+            )
+        try:
+            reason = await self._apply_pi_candidate(candidate, replace_existing=True)
+        except (CredentialStoreError, OSError, ValueError) as exc:
+            raise ProviderError(
+                "The Pi Kiro credential could not be stored safely.",
+                error_type="direct_auth_error",
+                status_code=400,
             ) from exc
+        if reason is not None:
+            raise ProviderError(reason, error_type="direct_auth_error", status_code=400)
         return self.control_state()
 
     async def start_direct_login(
@@ -357,13 +662,73 @@ class SwitchboardService:
         self.store.update_from_api(payload)
         return self.control_state()
 
+    @staticmethod
+    def _codex_agent_options(
+        payload: dict[str, Any], *, required: bool
+    ) -> tuple[bool | None, int | None]:
+        mode = payload.get("agent_mode")
+        if mode is None and not required:
+            if payload.get("agent_max_threads") is not None:
+                raise ValueError("agent_max_threads requires agent_mode.")
+            return None, None
+        if mode not in {"single", "limited", "parallel", "custom"}:
+            raise ValueError("agent_mode must be single, limited, parallel, or custom.")
+        requested_threads = payload.get("agent_max_threads")
+        if mode == "single":
+            if requested_threads is not None:
+                raise ValueError("single agent mode does not accept a thread limit.")
+            return False, None
+        if mode == "limited":
+            if requested_threads is not None:
+                raise ValueError("limited agent mode uses a fixed thread limit.")
+            return True, 2
+        if mode == "parallel":
+            if requested_threads is not None:
+                raise ValueError("parallel agent mode uses a fixed thread limit.")
+            return True, 4
+        if (
+            not isinstance(requested_threads, int)
+            or isinstance(requested_threads, bool)
+            or not 1 <= requested_threads <= 16
+        ):
+            raise ValueError("custom agent threads must be an integer from 1 to 16.")
+        return True, requested_threads
+
     def enable_codex_config(self, payload: dict[str, Any]) -> dict[str, Any]:
-        unknown = set(payload) - {"confirmation", "model"}
+        unknown = set(payload) - {
+            "confirmation",
+            "model",
+            "agent_mode",
+            "agent_max_threads",
+        }
         if unknown:
             raise ValueError(f"Unknown Codex config field: {sorted(unknown)[0]}")
         model = payload.get("model") or self.active_provider().model_id()
+        agents_enabled, max_agent_threads = self._codex_agent_options(
+            payload, required=False
+        )
         return self.codex_config.enable(
-            confirmation=payload.get("confirmation"), model=model
+            confirmation=payload.get("confirmation"),
+            model=model,
+            agents_enabled=agents_enabled,
+            max_agent_threads=max_agent_threads,
+        )
+
+    def configure_codex_agents(self, payload: dict[str, Any]) -> dict[str, Any]:
+        unknown = set(payload) - {
+            "confirmation",
+            "agent_mode",
+            "agent_max_threads",
+        }
+        if unknown:
+            raise ValueError(f"Unknown Codex config field: {sorted(unknown)[0]}")
+        agents_enabled, max_agent_threads = self._codex_agent_options(
+            payload, required=True
+        )
+        return self.codex_config.configure_agents(
+            confirmation=payload.get("confirmation"),
+            agents_enabled=agents_enabled,
+            max_agent_threads=max_agent_threads,
         )
 
     def disable_codex_config(self, payload: dict[str, Any]) -> dict[str, Any]:

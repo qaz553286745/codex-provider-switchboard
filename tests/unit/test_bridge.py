@@ -69,6 +69,27 @@ def test_parse_function_and_custom_tools() -> None:
     assert result.tool_calls[1].payload == "pwd"
 
 
+def test_tool_search_bridge_call_round_trips_as_client_execution() -> None:
+    tools = collect_request_tools({"tools": [{"type": "tool_search"}]})
+    envelope = {
+        "kind": "tool_calls",
+        "calls": [{"name": "tool_search", "payload": {"query": "github"}}],
+    }
+    value = (
+        "CODEX_SWITCHBOARD_BRIDGE_BEGIN_search\n"
+        + json.dumps(envelope)
+        + "\nCODEX_SWITCHBOARD_BRIDGE_END_search"
+    )
+
+    result = parse_bridge_output(value, tools, "search")
+    items = output_items(result)
+
+    assert result.tool_calls[0].tool_type == "tool_search"
+    assert items[0]["type"] == "tool_search_call"
+    assert items[0]["arguments"] == {"query": "github"}
+    assert items[0]["execution"] == "client"
+
+
 def test_parse_tool_calls_with_user_visible_commentary() -> None:
     envelope = {
         "kind": "tool_calls",
@@ -425,6 +446,30 @@ def test_render_prompt_groups_parallel_top_level_calls_without_exec() -> None:
         )[0]
     )
     assert payload["parallel_tool_calls"] is True
+
+
+def test_render_prompt_explains_safe_subagent_lifecycle() -> None:
+    prompt = render_bridge_prompt(
+        {
+            "input": "Coordinate the requested review.",
+            "tools": [
+                {
+                    "type": "namespace",
+                    "name": "collaboration",
+                    "tools": [
+                        {"type": "function", "name": "interrupt_agent"},
+                        {"type": "function", "name": "followup_task"},
+                        {"type": "function", "name": "wait_agent"},
+                    ],
+                }
+            ],
+        },
+        "nonce",
+    )
+
+    assert "Subagent orchestration safety" in prompt
+    assert "Never alternate ``interrupt_agent`` and ``followup_task``" in prompt
+    assert "use it for waiting" in prompt
 
 
 def test_render_prompt_compacts_metadata_and_trims_oldest_complete_turns() -> None:

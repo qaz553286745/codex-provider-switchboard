@@ -146,68 +146,235 @@ def test_direct_control_plane_is_safe_and_switches_native_openai(
     assert len(seen) == 2
 
 
-def test_pi_kiro_import_is_control_protected_redacted_and_does_not_switch_provider(
+def test_kiro_direct_http_stream_polls_existing_codex_command_before_upstream(
     tmp_path,
 ) -> None:
-    source = tmp_path / "pi-auth.json"
+    upstream_requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        upstream_requests.append(request)
+        return httpx.Response(500, json={"message": "must not be called"})
+
+    runtime = build_runtime(
+        settings=_settings(tmp_path),
+        config_path=tmp_path / "config.json",
+        direct_transport=httpx.MockTransport(handler),
+    )
+    runtime.credentials.set_oauth(
+        "kiro_direct",
+        access="test-kiro-access",
+        refresh="test-kiro-refresh",
+        expires_at=4_102_444_800_000,
+    )
+    app = create_app(runtime)
+    request_body = {
+        "stream": True,
+        "tools": [
+            {
+                "type": "custom",
+                "name": "exec",
+                "description": "Run JavaScript that can call nested tools.",
+            }
+        ],
+        "input": [
+            {
+                "type": "custom_tool_call",
+                "name": "exec",
+                "call_id": "call-run",
+                "input": (
+                    'const r = await tools.exec_command({cmd: "pytest -q"}); '
+                    "text(JSON.stringify(r));"
+                ),
+            },
+            {
+                "type": "custom_tool_call_output",
+                "call_id": "call-run",
+                "output": (
+                    '{"session_id":75696,"output":"... [45%]","wall_time_seconds":30.0}'
+                ),
+            },
+        ],
+    }
+
+    with TestClient(app, base_url="http://127.0.0.1") as client:
+        selected = client.put(
+            "/api/control/settings",
+            json={
+                "active_provider": "direct",
+                "direct": {
+                    "platform_id": "kiro_direct",
+                    "model_id": "gpt-5.6-sol",
+                },
+            },
+        )
+        assert selected.status_code == 200
+
+        response = client.post("/v1/responses", json=request_body)
+
+    assert response.status_code == 200
+    assert response.headers["x-switchboard-provider"] == "direct"
+    assert upstream_requests == []
+    events = _decode_events(response)
+    assert events[-1]["type"] == "response.completed"
+    poll = next(
+        item
+        for item in events[-1]["response"]["output"]
+        if item["type"] == "custom_tool_call"
+    )
+    assert poll["name"] == "exec"
+    assert "tools.write_stdin" in poll["input"]
+    assert "session_id: 75696" in poll["input"]
+    assert "tools.exec_command" not in poll["input"]
+
+
+def test_pi_accounts_can_be_previewed_and_imported_without_secret_echo(
+    tmp_path,
+) -> None:
+    source = tmp_path / "pi" / "agent" / "auth.json"
+    source.parent.mkdir(parents=True)
     source.write_text(
         json.dumps(
             {
                 "kiro": {
                     "type": "oauth",
-                    "access": "access-token",
-                    "refresh": "refresh-token|client-id|client-secret|idc",
+                    "access": "test-kiro-access",
+                    "refresh": "test-kiro-refresh|test-client|test-secret|idc",
                     "expires": 4_102_444_800_000,
-                    "clientId": "client-id",
-                    "clientSecret": "client-secret",
+                    "clientId": "test-client",
+                    "clientSecret": "test-secret",
                     "region": "us-east-1",
                     "authMethod": "idc",
-                }
+                },
+                "openai-codex": {
+                    "type": "oauth",
+                    "access": "test-openai-access",
+                    "refresh": "test-openai-refresh",
+                    "expires": 4_102_444_800_000,
+                    "accountId": "acct-test",
+                },
+                "cursor": {"type": "api_key", "key": "test-cursor-key"},
+                "unknown-provider": {"type": "api_key", "key": "test-unknown"},
             }
         ),
         encoding="utf-8",
     )
     source.chmod(0o600)
     runtime = build_runtime(
-        settings=_settings(tmp_path), config_path=tmp_path / "config.json"
+        settings=_settings(tmp_path),
+        config_path=tmp_path / "config.json",
+        pi_auth_path=source,
     )
-    runtime.oauth._pi_auth_path = source
     app = create_app(runtime)
 
     with TestClient(app, base_url="http://127.0.0.1") as client:
-        before = client.get("/api/control/state").json()["settings"]["active_provider"]
+        preview = client.get("/api/control/imports/pi")
+        assert preview.status_code == 200
+        assert {
+            (item["target_kind"], item["target_id"])
+            for item in preview.json()["candidates"]
+        } == {
+            ("cursor", "cursor"),
+            ("direct", "kiro_direct"),
+            ("direct", "openai_codex"),
+        }
+
         cross_origin = client.post(
-            "/api/control/direct/auth/kiro_direct/import",
-            json={"source": "pi"},
+            "/api/control/imports/pi",
+            json={"replace_existing": False},
             headers={"origin": "https://attacker.example"},
         )
         assert cross_origin.status_code == 403
 
-        arbitrary_path = client.post(
-            "/api/control/direct/auth/kiro_direct/import",
-            json={"source": "/tmp/auth.json"},
-        )
-        assert arbitrary_path.status_code == 400
-
-        imported = client.post(
+        single = client.post(
             "/api/control/direct/auth/kiro_direct/import",
             json={"source": "pi"},
         )
+        assert single.status_code == 200
+
+        imported = client.post(
+            "/api/control/imports/pi", json={"replace_existing": False}
+        )
         assert imported.status_code == 200
-        assert imported.json()["settings"]["active_provider"] == before
-        assert imported.json()["credentials"]["providers"]["kiro_direct"] == {
-            "configured": True,
-            "source": "credential_file",
-            "type": "oauth",
-            "expires_at": 4_102_444_800_000,
-            "metadata": {
-                "auth_method": "idc",
-                "region": "us-east-1",
-                "subscription": True,
-            },
+        body = imported.json()
+        assert {
+            (item["target_kind"], item["target_id"]) for item in body["imported"]
+        } == {("cursor", "cursor"), ("direct", "openai_codex")}
+        assert body["skipped"] == [
+            {
+                "source_provider": "kiro",
+                "target_kind": "direct",
+                "target_id": "kiro_direct",
+                "credential_type": "oauth",
+                "reason": "target already has a credential",
+            }
+        ]
+        assert body["state"]["settings"]["active_provider"] == "kiro"
+        assert runtime.store.api_key() == "test-cursor-key"
+        assert runtime.credentials.read("kiro_direct")["refresh"] == "test-kiro-refresh"
+        assert (
+            runtime.credentials.read("openai_codex")["extra"]["account_id"]
+            == "acct-test"
+        )
+
+        combined = preview.text + single.text + imported.text
+        for secret in (
+            "test-kiro-access",
+            "test-kiro-refresh",
+            "test-openai-access",
+            "test-openai-refresh",
+            "test-cursor-key",
+            "test-secret",
+        ):
+            assert secret not in combined
+
+
+def test_pi_bulk_import_reports_one_storage_failure_and_continues(
+    tmp_path, monkeypatch
+) -> None:
+    source = tmp_path / "pi-auth.json"
+    source.write_text(
+        json.dumps(
+            {
+                "openai": {"type": "api_key", "key": "test-openai-key"},
+                "cursor": {"type": "api_key", "key": "test-cursor-key"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    source.chmod(0o600)
+    runtime = build_runtime(
+        settings=_settings(tmp_path),
+        config_path=tmp_path / "config.json",
+        pi_auth_path=source,
+    )
+
+    def fail_set_api_key(_platform_id: str, _api_key: str) -> None:
+        raise OSError
+
+    monkeypatch.setattr(runtime.credentials, "set_api_key", fail_set_api_key)
+
+    with TestClient(create_app(runtime), base_url="http://127.0.0.1") as client:
+        response = client.post(
+            "/api/control/imports/pi", json={"replace_existing": False}
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert [(item["target_kind"], item["target_id"]) for item in body["imported"]] == [
+        ("cursor", "cursor")
+    ]
+    assert body["skipped"] == [
+        {
+            "source_provider": "openai",
+            "target_kind": "direct",
+            "target_id": "openai",
+            "credential_type": "api_key",
+            "reason": "credential could not be stored safely",
         }
-        for secret in ("access-token", "refresh-token", "client-id", "client-secret"):
-            assert secret not in imported.text
+    ]
+    assert runtime.store.api_key() == "test-cursor-key"
+    assert "test-openai-key" not in response.text
+    assert "test-cursor-key" not in response.text
 
 
 def test_oauth_callback_is_loopback_only_and_session_scoped(tmp_path) -> None:
@@ -300,6 +467,80 @@ class InterruptibleKiroRunner(ScriptedKiroRunner):
         )
         for start in range(0, len(wire), 7):
             yield wire[start : start + 7]
+
+
+class ReleasableKiroRunner(ScriptedKiroRunner):
+    def __init__(self) -> None:
+        super().__init__()
+        self.first_started = threading.Event()
+        self.release_first = threading.Event()
+        self.first_cancelled = threading.Event()
+
+    async def stream(
+        self,
+        prompt: str,
+        model: str,
+        effort: str | None,
+        **kwargs: Any,
+    ) -> AsyncIterator[str]:
+        self.calls.append(
+            {"prompt": prompt, "model": model, "effort": effort, **kwargs}
+        )
+        call_index = len(self.calls)
+        if call_index == 1:
+            self.first_started.set()
+            try:
+                while not self.release_first.is_set():
+                    await asyncio.sleep(0.005)
+            except asyncio.CancelledError:
+                self.first_cancelled.set()
+                raise
+        marker = re.search(r"CODEX_SWITCHBOARD_BRIDGE_BEGIN_([0-9a-f]+)", prompt)
+        assert marker is not None
+        nonce = marker.group(1)
+        wire = (
+            f"CODEX_SWITCHBOARD_BRIDGE_BEGIN_{nonce}\n"
+            + json.dumps(
+                {
+                    "kind": "message",
+                    "text": f"fifo answer {call_index}",
+                }
+            )
+            + f"\nCODEX_SWITCHBOARD_BRIDGE_END_{nonce}"
+        )
+        for start in range(0, len(wire), 7):
+            yield wire[start : start + 7]
+
+
+class ParallelKiroRunner(ScriptedKiroRunner):
+    def __init__(self) -> None:
+        super().__init__()
+        self.both_started = threading.Event()
+        self.release = threading.Event()
+
+    async def stream(
+        self,
+        prompt: str,
+        model: str,
+        effort: str | None,
+        **kwargs: Any,
+    ) -> AsyncIterator[str]:
+        self.calls.append(
+            {"prompt": prompt, "model": model, "effort": effort, **kwargs}
+        )
+        if len(self.calls) >= 2:
+            self.both_started.set()
+        while not self.release.is_set():
+            await asyncio.sleep(0.005)
+        marker = re.search(r"CODEX_SWITCHBOARD_BRIDGE_BEGIN_([0-9a-f]+)", prompt)
+        assert marker is not None
+        nonce = marker.group(1)
+        answer = "lane one" if "LANE_ONE" in prompt else "lane two"
+        yield (
+            f"CODEX_SWITCHBOARD_BRIDGE_BEGIN_{nonce}\n"
+            + json.dumps({"kind": "message", "text": answer})
+            + f"\nCODEX_SWITCHBOARD_BRIDGE_END_{nonce}"
+        )
 
 
 class ToolCallingKiroRunner(ScriptedKiroRunner):
@@ -681,8 +922,10 @@ def test_responses_websocket_prewarm_is_cached_without_provider_call(
             }
         )
         created = websocket.receive_json()
+        in_progress = websocket.receive_json()
         completed = websocket.receive_json()
         assert created["type"] == "response.created"
+        assert in_progress["type"] == "response.in_progress"
         assert completed["type"] == "response.completed"
         assert completed["response"]["id"] == created["response"]["id"]
         assert "PREWARMED_USER_INPUT" not in json.dumps([created, completed])
@@ -744,11 +987,11 @@ def test_responses_websocket_cancel_interrupts_active_provider(
     assert event["response"]["output"][0]["content"][0]["text"] == ("steered answer")
 
 
-def test_responses_websocket_new_create_steers_active_provider(
+def test_responses_websocket_new_create_is_fifo_without_implicit_cancellation(
     monkeypatch, tmp_path
 ) -> None:
     monkeypatch.delenv("CURSOR_API_KEY", raising=False)
-    runner = InterruptibleKiroRunner()
+    runner = ReleasableKiroRunner()
     runtime = build_runtime(
         settings=_settings(tmp_path),
         config_path=tmp_path / "config.json",
@@ -768,7 +1011,153 @@ def test_responses_websocket_new_create_steers_active_provider(
             {
                 "type": "response.create",
                 "model": "gpt-5.6-sol",
-                "input": "模型权重太大, 请调整方向",
+                "input": "second request",
+            }
+        )
+        assert not runner.first_cancelled.wait(0.05)
+        assert len(runner.calls) == 1
+        runner.release_first.set()
+        completed: list[dict[str, Any]] = []
+        while len(completed) < 2:
+            event = websocket.receive_json()
+            if event["type"] == "response.completed":
+                completed.append(event["response"])
+
+    assert not runner.first_cancelled.is_set()
+    assert len(runner.calls) == 2
+    assert [item["output"][0]["content"][0]["text"] for item in completed] == [
+        "fifo answer 1",
+        "fifo answer 2",
+    ]
+    assert "second request" in runner.calls[1]["prompt"]
+
+
+def test_responses_websocket_named_lanes_run_in_parallel_and_echo_stream_id(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.delenv("CURSOR_API_KEY", raising=False)
+    runner = ParallelKiroRunner()
+    runtime = build_runtime(
+        settings=_settings(tmp_path, kiro_max_concurrency=2),
+        config_path=tmp_path / "config.json",
+        kiro_runner=runner,
+    )
+
+    with TestClient(create_app(runtime), base_url="http://127.0.0.1").websocket_connect(
+        "/v1/responses", headers={"host": "127.0.0.1"}
+    ) as websocket:
+        websocket.send_json(
+            {
+                "type": "response.create",
+                "stream_id": "lane.one",
+                "model": "gpt-5.6-sol",
+                "client_metadata": {"thread_id": "parallel-thread-one"},
+                "input": "LANE_ONE",
+            }
+        )
+        websocket.send_json(
+            {
+                "type": "response.create",
+                "stream_id": "lane-two",
+                "model": "gpt-5.6-sol",
+                "client_metadata": {"thread_id": "parallel-thread-two"},
+                "input": "LANE_TWO",
+            }
+        )
+        assert runner.both_started.wait(1)
+        runner.release.set()
+        received: list[dict[str, Any]] = []
+        completed: dict[str, dict[str, Any]] = {}
+        while len(completed) < 2:
+            event = websocket.receive_json()
+            received.append(event)
+            if event["type"] == "response.completed":
+                completed[event["stream_id"]] = event["response"]
+
+    assert len(runner.calls) == 2
+    assert {event["stream_id"] for event in received} == {"lane.one", "lane-two"}
+    assert completed["lane.one"]["output"][0]["content"][0]["text"] == "lane one"
+    assert completed["lane-two"]["output"][0]["content"][0]["text"] == ("lane two")
+
+
+def test_responses_websocket_named_lane_error_is_request_scoped(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.delenv("CURSOR_API_KEY", raising=False)
+    runner = ScriptedKiroRunner()
+    runtime = build_runtime(
+        settings=_settings(tmp_path),
+        config_path=tmp_path / "config.json",
+        kiro_runner=runner,  # type: ignore[arg-type]
+    )
+
+    with TestClient(create_app(runtime), base_url="http://127.0.0.1").websocket_connect(
+        "/v1/responses", headers={"host": "127.0.0.1"}
+    ) as websocket:
+        websocket.send_json(
+            {
+                "type": "response.create",
+                "stream_id": "lane-error",
+                "model": "gpt-5.6-sol",
+                "previous_response_id": "resp_not_cached",
+                "input": [],
+            }
+        )
+        error = websocket.receive_json()
+
+    assert error["type"] == "error"
+    assert error["stream_id"] == "lane-error"
+    assert error["error"]["code"] == "previous_response_not_found"
+    assert runner.calls == []
+
+
+def test_responses_websocket_failed_branch_preserves_parent_lineage(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.delenv("CURSOR_API_KEY", raising=False)
+    runner = ScriptedKiroRunner()
+    runtime = build_runtime(
+        settings=_settings(tmp_path),
+        config_path=tmp_path / "config.json",
+        kiro_runner=runner,  # type: ignore[arg-type]
+    )
+
+    with TestClient(create_app(runtime), base_url="http://127.0.0.1").websocket_connect(
+        "/v1/responses", headers={"host": "127.0.0.1"}
+    ) as websocket:
+        websocket.send_json(
+            {
+                "type": "response.create",
+                "generate": False,
+                "model": "gpt-5.6-sol",
+                "input": "A" * 600_000,
+            }
+        )
+        parent_id: str | None = None
+        while True:
+            event = websocket.receive_json()
+            if event["type"] == "response.completed":
+                parent_id = event["response"]["id"]
+                break
+
+        websocket.send_json(
+            {
+                "type": "response.create",
+                "model": "gpt-5.6-sol",
+                "previous_response_id": parent_id,
+                "input": "B" * 600_000,
+            }
+        )
+        oversized = websocket.receive_json()
+        assert oversized["type"] == "error"
+        assert oversized["status"] == 413
+
+        websocket.send_json(
+            {
+                "type": "response.create",
+                "model": "gpt-5.6-sol",
+                "previous_response_id": parent_id,
+                "input": "valid branch",
             }
         )
         while True:
@@ -776,9 +1165,55 @@ def test_responses_websocket_new_create_steers_active_provider(
             if event["type"] == "response.completed":
                 break
 
-    assert runner.first_cancelled.is_set()
-    assert len(runner.calls) == 2
-    assert "模型权重太大, 请调整方向" in runner.calls[1]["prompt"]
+    assert len(runner.calls) == 1
+    assert "valid branch" in runner.calls[0]["prompt"]
+
+
+def test_responses_websocket_incomplete_provider_stream_fails_terminally(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.delenv("CURSOR_API_KEY", raising=False)
+    runtime = build_runtime(
+        settings=_settings(tmp_path), config_path=tmp_path / "config.json"
+    )
+
+    class IncompleteProvider:
+        provider_id = "kiro"
+
+        async def complete(self, _body: dict[str, Any]):
+            raise AssertionError("not used")
+
+        async def stream(self, _body: dict[str, Any]) -> AsyncIterator[bytes]:
+            yield (
+                b'event: response.created\ndata: {"type":"response.created",'
+                b'"sequence_number":0,"response":{"id":"resp_partial",'
+                b'"object":"response","status":"in_progress","output":[]}}\n\n'
+            )
+
+        def model_id(self) -> str:
+            return "gpt-test"
+
+    runtime.service.providers["kiro"] = IncompleteProvider()  # type: ignore[assignment]
+
+    with TestClient(create_app(runtime), base_url="http://127.0.0.1").websocket_connect(
+        "/v1/responses", headers={"host": "127.0.0.1"}
+    ) as websocket:
+        websocket.send_json(
+            {
+                "type": "response.create",
+                "stream_id": "terminal-lane",
+                "model": "gpt-test",
+                "input": "hello",
+            }
+        )
+        created = websocket.receive_json()
+        failed = websocket.receive_json()
+
+    assert created["type"] == "response.created"
+    assert failed["type"] == "response.failed"
+    assert failed["stream_id"] == "terminal-lane"
+    assert failed["response"]["id"] == "resp_partial"
+    assert failed["response"]["error"]["code"] == "upstream_stream_incomplete"
 
 
 def test_responses_websocket_generated_continuation_restores_tools_and_session(
@@ -934,8 +1369,63 @@ def test_native_remote_compaction_is_rejected_without_invoking_kiro(
     assert error["type"] == "error"
     assert error["status"] == 400
     assert error["error"]["type"] == "unsupported_feature"
-    assert "dedicated codex-provider-switchboard provider" in error["error"]["message"]
+    assert "selected provider cannot execute" in error["error"]["message"]
     assert runner.calls == []
+
+
+def test_native_responses_compaction_is_forwarded_only_to_capable_provider(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        assert request.url.path == "/v1/responses/compact"
+        payload = json.loads(request.content)
+        assert payload["model"] == "gpt-test"
+        assert "namespace" not in payload["input"][0]
+        return httpx.Response(
+            200,
+            json={
+                "id": "resp_compact_1",
+                "object": "response.compaction",
+                "output": [{"type": "compaction", "encrypted_content": "opaque"}],
+            },
+        )
+
+    runtime = build_runtime(
+        settings=_settings(tmp_path),
+        config_path=tmp_path / "config.json",
+        direct_transport=httpx.MockTransport(handler),
+    )
+    runtime.credentials.set_api_key("openai", "sk-test")
+    runtime.store.update_from_api(
+        {
+            "active_provider": "direct",
+            "direct": {"platform_id": "openai", "model_id": "gpt-test"},
+        }
+    )
+
+    with TestClient(create_app(runtime), base_url="http://127.0.0.1") as client:
+        response = client.post(
+            "/v1/responses/compact",
+            json={
+                "input": [
+                    {
+                        "type": "function_call",
+                        "namespace": "files",
+                        "name": "read",
+                        "call_id": "call_1",
+                    }
+                ]
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.headers["x-switchboard-provider"] == "direct"
+    assert response.json()["object"] == "response.compaction"
+    assert len(seen) == 1
 
 
 def test_models_endpoint_supports_openai_and_codex_catalog_shapes(tmp_path) -> None:
@@ -1951,19 +2441,35 @@ def test_codex_config_control_requires_confirmation_and_restores_backup(
             )
             enabled = await client.post(
                 "/api/control/codex-config/enable",
-                json={"confirmation": "ENABLE", "model": "gpt-5.6-sol"},
+                json={
+                    "confirmation": "ENABLE",
+                    "model": "gpt-5.6-sol",
+                    "agent_mode": "single",
+                },
             )
             status = await client.get("/api/control/codex-config")
+            agents = await client.post(
+                "/api/control/codex-config/agents",
+                json={"confirmation": "APPLY", "agent_mode": "limited"},
+            )
+            active_config = tomllib.loads(config_path.read_text())
+            assert active_config["agents"] == {
+                "enabled": True,
+                "max_concurrent_threads_per_session": 2,
+            }
             restored = await client.post(
                 "/api/control/codex-config/disable",
                 json={"confirmation": "RESTORE"},
             )
-        return rejected, enabled, status, restored
+        return rejected, enabled, status, agents, restored
 
-    rejected, enabled, status, restored = asyncio.run(scenario())
+    rejected, enabled, status, agents, restored = asyncio.run(scenario())
     assert rejected.status_code == 400
     assert enabled.status_code == 200
+    assert enabled.json()["agents"]["enabled"] is False
     assert status.json()["active"] is True
+    assert agents.status_code == 200
+    assert agents.json()["agents"]["mode"] == "limited"
     assert restored.json()["active"] is False
     assert tomllib.loads(config_path.read_text()) == tomllib.loads(original.decode())
 

@@ -1,14 +1,17 @@
 # Codex Provider Switchboard
 
-### One local Responses endpoint for CLIs, direct platforms, and private gateways
+### A local AI-provider reverse proxy and protocol adapter for Codex
 
-| [Quick start](#quick-start) | [Configuration](docs/configuration.md) | [Local API](docs/api.md) | [Architecture](docs/architecture.md) | [Security](SECURITY.md) | [Contributing](CONTRIBUTING.md) |
+| [Quick start](#quick-start) | [Configuration](https://github.com/qaz553286745/codex-provider-switchboard/blob/main/docs/configuration.md) | [Local API](https://github.com/qaz553286745/codex-provider-switchboard/blob/main/docs/api.md) | [Architecture](https://github.com/qaz553286745/codex-provider-switchboard/blob/main/docs/architecture.md) | [Security](https://github.com/qaz553286745/codex-provider-switchboard/blob/main/SECURITY.md) | [Contributing](https://github.com/qaz553286745/codex-provider-switchboard/blob/main/CONTRIBUTING.md) |
 | --- | --- | --- | --- | --- | --- |
 
-[简体中文](README.zh-CN.md)
+[English](https://github.com/qaz553286745/codex-provider-switchboard/blob/main/README.md) |
+[简体中文](https://github.com/qaz553286745/codex-provider-switchboard/blob/main/README.zh-CN.md)
 
-A local, OpenAI Responses-compatible control plane that gives Codex one stable
-endpoint while you switch between provider adapters.
+A local, OpenAI Responses-compatible reverse proxy and control plane that gives
+Codex one stable endpoint while you switch between provider adapters. It is not
+a byte-for-byte transparent proxy: it also translates protocols, normalizes
+streaming events, and maintains task-to-upstream session affinity.
 
 Today it supports:
 
@@ -31,10 +34,11 @@ local web control panel; Codex keeps the same base URL.
 > endorsed by, or supported by OpenAI, Kiro/AWS, or Cursor. Review each
 > provider's terms, security model, and billing before use.
 
-The direct-provider implementation is native to this repository. It does not
-install or import Pi, `@mariozechner/pi-ai`, a Node worker, or any provider
-plugin. Pi's public provider matrix was used only as product research; protocol,
-credential, streaming, and UI code here is maintained independently.
+The provider implementation is native to this repository. It does not install
+or execute Pi, `@mariozechner/pi-ai`, a Node worker, or a Pi provider plugin.
+As an optional migration convenience, a user-triggered importer can read only
+Pi's fixed `~/.pi/agent/auth.json` file and copy allow-listed credentials into
+Switchboard's own stores. Pi is a credential source, never a runtime dependency.
 
 Billing follows the selected upstream: Kiro requests use the account authenticated
 in `kiro-cli`, Cursor requests use the configured Cursor account, and custom-provider
@@ -66,13 +70,22 @@ flowchart LR
 ## Highlights
 
 - One fixed local endpoint: `http://127.0.0.1:8787/v1`.
-- Real SSE lifecycle events and Codex Responses WebSocket transport.
+- Real SSE lifecycle events and Codex Responses WebSocket transport: same-lane
+  FIFO, parallel named lanes, explicit lane-local cancellation, and bounded
+  `previous_response_id` lineage without implicit request cancellation.
+- Capability-driven Responses compatibility: native Codex providers retain
+  custom tools, `tool_search`, namespaces, multi-agent events, lineage headers,
+  and remote compaction; narrower gateways receive reversible function lowering
+  instead of provider-specific rewrites scattered across routes.
 - Codex-native progress rendering: final answers use `final_answer`, concise
   pre-tool updates use `commentary`, and real `update_plan` calls can drive the
   native step indicator without exposing hidden chain-of-thought.
 - Per-task affinity: one Codex task maps to one Kiro session or Cursor agent.
 - Subagent isolation: `client_metadata.thread_id` takes precedence, so Codex
   subagents do not share the parent task's provider session.
+- Provider-independent subagent loop protection: repeated interrupt/restart
+  cycles and status polling terminate locally with a visible final message,
+  rather than consuming provider tokens indefinitely.
 - Parallel-task routing with isolated workdirs; raise `KIRO_MAX_CONCURRENCY` or
   `CURSOR_CLI_MAX_CONCURRENCY` above the conservative default of `1` to allow
   simultaneous local CLI processes.
@@ -93,14 +106,20 @@ flowchart LR
 - Independent direct-provider credentials: environment variables take priority;
   submitted keys and OAuth refresh tokens are stored separately from ordinary
   settings in an atomic `0600` file. Switchboard never reads or copies
-  `~/.codex/auth.json`. For experimental direct Kiro access, the dashboard can
-  explicitly import the Kiro OAuth record from the fixed
-  `~/.pi/agent/auth.json` source; arbitrary paths are rejected.
+  `~/.codex/auth.json`.
+- Preview-first Pi migration: one action can import compatible Kiro, Cursor,
+  OpenAI/ChatGPT Codex, Anthropic, GitHub Copilot, xAI, and OpenRouter records
+  from the fixed `~/.pi/agent/auth.json` source. Existing credentials are
+  skipped unless overwrite is explicitly confirmed; secrets are never echoed.
 - Quota cards backed by Kiro `/usage`, Cursor's documented account/agent usage
   boundary, and optional JSON-field mapping for third-party quota endpoints.
 - Confirmed Codex config takeover: a timestamped backup plus field-level apply,
   conflict detection, and restore that preserves Codex-managed plugin,
   marketplace, desktop, and other unrelated updates.
+- Dashboard agent modes: single-agent (the recommended default), fixed two- or
+  four-thread multi-agent limits, and a bounded custom limit. Disabling
+  `[agents].enabled` removes only Codex multi-agent tools; ordinary terminal,
+  file, browser, and other tool calls remain available.
 - Four-MiB absolute Kiro/Cursor prompt bounds with metadata compaction and
   oldest complete-turn trimming. Cursor CLI additionally derives a conservative
   input budget from the advertised 272K/1M context; the active turn is never
@@ -130,8 +149,9 @@ flowchart LR
 - For direct providers: the selected platform's API key or interactive account
   login. API-key OpenAI, Anthropic, xAI, and OpenRouter paths are the preferred
   stable choices; subscription OAuth adapters and direct Kiro are explicitly
-  experimental. Direct Kiro can also import an existing Pi Kiro login from
-  `~/.pi/agent/auth.json`; the import does not change the active provider.
+  experimental.
+- Pi is optional. If it already contains compatible accounts, the dashboard can
+  import them without starting Pi or changing the active provider.
 
 The Kiro adapter is currently macOS-oriented because it is intended to reuse a
 desktop-authenticated local CLI. The Python service itself is portable.
@@ -162,6 +182,12 @@ and progress without ever reading credentials back. Cursor intentionally stays
 on the official local `cursor-agent` path (or optional Cloud Agents API); the
 project does not embed unofficial Cursor internal RPC adapters.
 
+If Pi is installed and already authenticated, use **Scan importable accounts**
+under Native Provider Configuration, review the redacted preview, and then use
+**Import available accounts**. The default leaves existing Switchboard
+credentials untouched. Cursor is imported only when Pi contains an explicit
+`cursor` or `cursor-agent` API-key record; no other Cursor files are scraped.
+
 The key is never returned to the browser after it is submitted. By default it
 is stored in the per-user configuration file. `CURSOR_API_KEY` can be used
 instead; the environment always overrides the file.
@@ -170,14 +196,23 @@ instead; the environment always overrides the file.
 
 The dashboard can install the provider into your **user-level**
 `~/.codex/config.toml`. Type `ENABLE` to create a timestamped backup and apply
-only the connection fields needed by the local proxy. Type `RESTORE` to restore
-only those managed fields. Unrelated edits made while the proxy is active,
+only the connection fields needed by the local proxy plus the agent mode chosen
+on the dashboard. Type `APPLY` to change only the agent mode while takeover is
+active, or `RESTORE` to restore only those managed fields. Unrelated edits made
+while the proxy is active,
 including Codex's automatic plugin, marketplace, and desktop updates, remain.
 Managed-field drift does not lock disable: a verified backup restores those
 fields into the current document. If the backup is missing or invalid, disable
 conservatively removes only recorded Switchboard routing values and retains the
 current model. A routing configuration already restored outside the dashboard
 is detected and its stale active state is cleared automatically.
+
+The dashboard defaults to **Single agent** for new takeovers. This writes
+`[agents].enabled = false`; it does not disable ordinary Codex tools. The two-
+thread, four-thread, and custom options write
+`agents.max_concurrent_threads_per_session` only when multi-agent support is
+enabled. Those agent keys participate in the same field-level backup and
+restore contract as the provider route.
 
 The takeover does not modify `features.enable_request_compression`. The local
 HTTP fallback accepts bounded gzip, deflate, and zstd JSON bodies, so the user's
@@ -186,9 +221,11 @@ compression preference and surrounding feature settings remain untouched.
 For the default built-in OpenAI provider, the dashboard installs a dedicated
 `codex-provider-switchboard` provider identity. This is intentional: Codex
 treats a provider named exactly `OpenAI` as supporting native remote
-compaction, while this compatibility layer does not produce OpenAI's opaque
-compaction items. The dedicated identity makes Codex use its normal local
-summary path instead of sending an unsupported `compaction_trigger` request.
+compaction, while the same Switchboard endpoint may currently route to Kiro or
+Cursor. The dedicated identity makes those prompt-bridge routes use Codex's
+normal local summary path instead of sending an unsupported
+`compaction_trigger` request. Direct OpenAI routes and custom gateways explicitly
+set to `native_codex` can use the profile-gated `/responses/compact` path.
 If the current configuration already selects a non-reserved custom provider,
 that provider ID is retained and its connection table is temporarily managed.
 
@@ -210,7 +247,9 @@ stream_max_retries = 0
 
 Do not substitute `openai_base_url` for this block: that makes current Codex
 builds classify the loopback adapter as the native OpenAI provider and enables
-remote compaction that the adapter cannot satisfy. [`demo_config.toml`](demo_config.toml)
+remote compaction even when the selected upstream is Kiro, Cursor, or another
+non-native provider.
+[`demo_config.toml`](https://github.com/qaz553286745/codex-provider-switchboard/blob/main/demo_config.toml)
 also shows authenticated and direct third-party variants.
 
 Restart or start a Codex task after changing the configuration. Current Codex
@@ -264,12 +303,16 @@ For each request, the switchboard prefers `client_metadata.thread_id` and falls
 back to `prompt_cache_key`. It hashes that value before using it on disk. A
 continuation is accepted only when the new input begins with the exact
 fingerprint sequence committed by the preceding successful response.
-For Responses WebSocket mode, the connection-local `previous_response_id`
-state first expands Codex's incremental input into that exact logical sequence;
+For Responses WebSocket mode, the connection-local bounded
+`previous_response_id` cache first expands Codex's incremental input into that
+exact logical sequence;
 this also carries forward the request's instructions and tool catalog. When
 session reuse then reduces the logical history to only its new input suffix,
 the tool catalog is materialized from the full logical request so a preceding
 `additional_tools` item cannot turn into a misleading `tools: []` continuation.
+`stream_id` is used only for FIFO/concurrent lane routing; it does not replace
+lineage. A new request never cancels an active request unless Codex sends an
+explicit `response.cancel` for that lane.
 
 This means:
 
@@ -306,7 +349,8 @@ credential patterns, bridge nonces, and session-like identifiers.
 
 The file-backed API key is protected with filesystem permissions, not the OS
 Keychain. Treat the host account as part of the trust boundary. For the full
-threat model and reporting process, read [SECURITY.md](SECURITY.md).
+threat model and reporting process, read
+[SECURITY.md](https://github.com/qaz553286745/codex-provider-switchboard/blob/main/SECURITY.md).
 
 ## Cursor is an agent adapter, not a raw LLM endpoint
 
@@ -326,6 +370,7 @@ and [Cloud Agents API](https://cursor.com/cn/docs/cloud-agent/api/endpoints).
 ```text
 .
 ├── src/codex_provider_switchboard/
+│   ├── compatibility/   # capability profiles and reversible Responses adapters
 │   ├── domain/          # Responses translation and strict bridge protocol
 │   ├── application/     # provider routing and content-free inspection
 │   ├── infrastructure/  # config, sessions, subprocesses, and HTTP clients
@@ -339,9 +384,13 @@ and [Cloud Agents API](https://cursor.com/cn/docs/cloud-agent/api/endpoints).
 └── pyproject.toml        # packaging, lint, and test policy
 ```
 
-Read [docs/architecture.md](docs/architecture.md) for the request and session
-flows, [docs/configuration.md](docs/configuration.md) for all settings, and
-[docs/api.md](docs/api.md) for the local HTTP surface.
+Read the
+[architecture](https://github.com/qaz553286745/codex-provider-switchboard/blob/main/docs/architecture.md)
+for the request and session flows, the
+[configuration reference](https://github.com/qaz553286745/codex-provider-switchboard/blob/main/docs/configuration.md)
+for all settings, and the
+[local API reference](https://github.com/qaz553286745/codex-provider-switchboard/blob/main/docs/api.md)
+for the HTTP surface.
 
 ## Development
 
@@ -351,13 +400,15 @@ uv run ruff check .
 uv run ruff format --check .
 uv run python scripts/check_repository.py
 uv run pytest --cov
-uv build
-uv run twine check dist/*
-uv run python scripts/check_artifacts.py dist
+uv run python scripts/build_release.py --python 3.11 --allow-dirty
 ```
 
-Contributions are welcome. Start with [CONTRIBUTING.md](CONTRIBUTING.md).
-Release maintainers should also follow [RELEASING.md](RELEASING.md).
+Contributions are welcome. Start with the
+[contributing guide](https://github.com/qaz553286745/codex-provider-switchboard/blob/main/CONTRIBUTING.md).
+Release maintainers should also follow the
+[English release guide](https://github.com/qaz553286745/codex-provider-switchboard/blob/main/RELEASING.md)
+or its
+[Chinese translation](https://github.com/qaz553286745/codex-provider-switchboard/blob/main/RELEASING.zh-CN.md).
 
 ## Limitations
 
@@ -373,8 +424,9 @@ Release maintainers should also follow [RELEASING.md](RELEASING.md).
   fake plan state.
 - The Codex Responses WebSocket mode is supported; this is not an implementation
   of the unrelated Realtime audio API.
-- Native OpenAI remote-compaction output is not implemented. Use the dedicated
-  provider configuration above so Codex selects its local summary path.
+- Native remote compaction is forwarded only for `native_codex` direct/custom
+  providers. Kiro, Cursor, prompt bridges, and function-only gateways reject it
+  explicitly and should use the dedicated provider configuration above.
 - Cursor CLI and the documented Cloud Agents API do not expose account
   remaining balance. The dashboard verifies the selected backend, shows
   last-run token usage when available, and links to Cursor's authoritative
@@ -384,4 +436,4 @@ Release maintainers should also follow [RELEASING.md](RELEASING.md).
 
 ## License
 
-[MIT](LICENSE)
+[MIT](https://github.com/qaz553286745/codex-provider-switchboard/blob/main/LICENSE)

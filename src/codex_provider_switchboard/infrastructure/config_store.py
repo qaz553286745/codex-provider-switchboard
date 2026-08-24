@@ -14,10 +14,11 @@ from urllib.parse import urlsplit
 from ..settings import default_data_dir
 from .direct_catalog import DIRECT_PLATFORM_IDS
 
-CONFIG_VERSION = 4
+CONFIG_VERSION = 5
 CURSOR_BASE_URL = "https://api.cursor.com"
 CURSOR_BACKENDS = frozenset({"cli", "cloud_api"})
 PROVIDER_IDS = frozenset({"kiro", "cursor", "custom", "direct"})
+CUSTOM_COMPATIBILITY_PROFILES = frozenset({"function_only", "native_codex"})
 _SECRET_LIMIT = 4_096
 _TEXT_LIMIT = 500
 
@@ -57,6 +58,7 @@ def _defaults(kiro_model: str) -> dict[str, Any]:
             "quota_reset_field": "",
             "quota_unit": "credits",
             "timeout_seconds": 300,
+            "compatibility_profile": "function_only",
         },
         "direct": {
             "platform_id": "openai_codex",
@@ -241,7 +243,13 @@ class ConfigStore:
 
     def _normalized(self, value: Any) -> dict[str, Any]:
         result = _defaults(self.kiro_model)
-        if not isinstance(value, dict) or value.get("version") not in {1, 2, 3, 4}:
+        if not isinstance(value, dict) or value.get("version") not in {
+            1,
+            2,
+            3,
+            4,
+            5,
+        }:
             return result
 
         provider = value.get("active_provider")
@@ -329,6 +337,9 @@ class ConfigStore:
                 "custom.timeout_seconds",
                 fallback=300,
             )
+            profile = custom.get("compatibility_profile")
+            if profile in CUSTOM_COMPATIBILITY_PROFILES:
+                result["custom"]["compatibility_profile"] = profile
 
         direct = value.get("direct")
         if isinstance(direct, dict):
@@ -479,6 +490,7 @@ class ConfigStore:
                 "quota_reset_field",
                 "quota_unit",
                 "timeout_seconds",
+                "compatibility_profile",
             }
             unknown_custom = set(custom_update) - allowed
             if unknown_custom:
@@ -487,6 +499,12 @@ class ConfigStore:
                 )
             custom = current["custom"]
             self._apply_secret_update(custom, custom_update)
+            profile = custom_update.get("compatibility_profile")
+            if profile is not None and profile not in CUSTOM_COMPATIBILITY_PROFILES:
+                raise ValueError(
+                    "custom.compatibility_profile must be function_only or "
+                    "native_codex."
+                )
             for key in allowed - {"api_key", "clear_api_key"}:
                 if key in custom_update:
                     custom[key] = custom_update[key]

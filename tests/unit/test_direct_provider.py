@@ -198,7 +198,46 @@ class _KiroCompletionClient:
             yield {
                 "name": final_name,
                 "toolUseId": "internal-final-1",
-                "input": json.dumps({"final_answer": "All checks completed."}),
+                "input": json.dumps(
+                    {
+                        "outcome": "completed",
+                        "final_answer": "All checks completed.",
+                    }
+                ),
+                "stop": True,
+            }
+        elif round_kind == "failed":
+            yield {
+                "name": final_name,
+                "toolUseId": "internal-final-failed",
+                "input": json.dumps(
+                    {
+                        "outcome": "failed",
+                        "final_answer": (
+                            "I'm sorry, but I couldn't complete the refactor "
+                            "within this run."
+                        ),
+                    }
+                ),
+                "stop": True,
+            }
+        elif round_kind == "blocked":
+            yield {
+                "name": final_name,
+                "toolUseId": "internal-final-blocked",
+                "input": json.dumps(
+                    {
+                        "outcome": "blocked",
+                        "final_answer": "A required external decision is missing.",
+                    }
+                ),
+                "stop": True,
+            }
+        elif round_kind == "missing_outcome":
+            yield {
+                "name": final_name,
+                "toolUseId": "internal-final-invalid",
+                "input": json.dumps({"final_answer": "Not actually complete."}),
                 "stop": True,
             }
         elif round_kind == "normal_tool":
@@ -267,6 +306,65 @@ def test_kiro_internal_final_tool_becomes_a_real_final_answer(tmp_path) -> None:
         )
     )
     assert "Plain assistant text is progress commentary" in internal_tool["description"]
+    schema = internal_tool["inputSchema"]["json"]
+    assert schema["required"] == ["outcome", "final_answer"]
+    assert schema["properties"]["outcome"]["enum"] == [
+        "completed",
+        "blocked",
+        "failed",
+    ]
+
+
+def test_kiro_semantic_failure_is_a_normal_terminal_message(tmp_path) -> None:
+    client = _KiroCompletionClient(["failed"])
+    provider = _kiro_provider(tmp_path, client)
+
+    async def scenario() -> bytes:
+        return b"".join([chunk async for chunk in provider.stream(_kiro_body())])
+
+    events = _events(asyncio.run(scenario()))
+    assert events[-1]["type"] == "response.completed"
+    assert not any(event["type"] == "response.failed" for event in events)
+    final = next(
+        item
+        for item in events[-1]["response"]["output"]
+        if item.get("phase") == "final_answer"
+    )
+    assert "Task could not be completed" in final["content"][0]["text"]
+    assert "couldn't complete" in final["content"][0]["text"]
+
+
+def test_kiro_semantic_block_is_a_normal_terminal_message(tmp_path) -> None:
+    client = _KiroCompletionClient(["blocked"])
+    provider = _kiro_provider(tmp_path, client)
+
+    async def scenario() -> bytes:
+        return b"".join([chunk async for chunk in provider.stream(_kiro_body())])
+
+    events = _events(asyncio.run(scenario()))
+    assert events[-1]["type"] == "response.completed"
+    assert not any(event["type"] == "response.failed" for event in events)
+    final = next(
+        item
+        for item in events[-1]["response"]["output"]
+        if item.get("phase") == "final_answer"
+    )
+    assert final["content"][0]["text"].startswith(
+        "[provider-switchboard] Task blocked:"
+    )
+
+
+def test_kiro_terminal_outcome_is_required(tmp_path) -> None:
+    client = _KiroCompletionClient(["missing_outcome"])
+    provider = _kiro_provider(tmp_path, client)
+
+    async def scenario() -> bytes:
+        return b"".join([chunk async for chunk in provider.stream(_kiro_body())])
+
+    events = _events(asyncio.run(scenario()))
+    assert events[-1]["type"] == "response.failed"
+    assert "without a valid outcome" in events[-1]["response"]["error"]["message"]
+    assert not any(event["type"] == "response.completed" for event in events)
 
 
 def test_kiro_plain_progress_is_continued_before_completion(tmp_path) -> None:
@@ -336,4 +434,52 @@ def test_kiro_normal_tool_call_still_ends_the_agent_round(tmp_path) -> None:
     function_call = next(item for item in output if item["type"] == "function_call")
     assert function_call["name"] == "read_file"
     assert json.loads(function_call["arguments"]) == {"path": "status.txt"}
+    assert not any(item.get("phase") == "final_answer" for item in output)
+
+
+def test_kiro_running_exec_session_is_polled_without_an_upstream_model_call(
+    tmp_path,
+) -> None:
+    client = _KiroCompletionClient(["failed"])
+    provider = _kiro_provider(tmp_path, client)
+    exec_tool = {
+        "type": "custom",
+        "name": "exec",
+        "description": "Run JavaScript that can call nested tools.",
+    }
+    body = {
+        "stream": True,
+        "tools": [exec_tool],
+        "input": [
+            {
+                "type": "custom_tool_call",
+                "name": "exec",
+                "call_id": "call-run",
+                "input": (
+                    'const r = await tools.exec_command({cmd: "pytest -q"}); '
+                    "text(JSON.stringify(r));"
+                ),
+            },
+            {
+                "type": "custom_tool_call_output",
+                "call_id": "call-run",
+                "output": (
+                    '{"session_id":75696,"output":"... [45%]","wall_time_seconds":30.0}'
+                ),
+            },
+        ],
+    }
+
+    async def scenario() -> bytes:
+        return b"".join([chunk async for chunk in provider.stream(body)])
+
+    events = _events(asyncio.run(scenario()))
+    assert client.payloads == []
+    assert events[-1]["type"] == "response.completed"
+    output = events[-1]["response"]["output"]
+    poll = next(item for item in output if item["type"] == "custom_tool_call")
+    assert poll["name"] == "exec"
+    assert "tools.write_stdin" in poll["input"]
+    assert "session_id: 75696" in poll["input"]
+    assert "tools.exec_command" not in poll["input"]
     assert not any(item.get("phase") == "final_answer" for item in output)

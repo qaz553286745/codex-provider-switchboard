@@ -241,6 +241,20 @@
             <span><strong>跟随 Codex 推理档位</strong><small>将 Codex 的 low / high / xhigh / max 映射到平台支持的推理配置</small></span>
             <input id="direct-follow-effort" type="checkbox" checked /><span class="switch-ui" aria-hidden="true"></span>
           </label>
+          <section class="credential-import full-field" aria-labelledby="pi-import-title">
+            <div>
+              <strong id="pi-import-title">Pi 账号一键接入</strong>
+              <p>只读扫描固定的 <code>~/.pi/agent/auth.json</code>，复制可验证的 Kiro、Cursor 与原生平台凭据；不会启动 Pi，也不会回显 Token。</p>
+            </div>
+            <div class="credential-import-actions">
+              <label class="compact-check"><input id="pi-import-replace" type="checkbox" />覆盖 Switchboard 已有凭据</label>
+              <button class="ghost-button" id="scan-pi-auth" type="button">扫描可导入账号</button>
+              <button class="secondary-button" id="import-pi-auth" type="button">一键导入可用账号</button>
+            </div>
+            <ul class="credential-import-results" id="pi-import-results" aria-live="polite">
+              <li>尚未扫描；Cursor 只有在 Pi 中存在明确的 API Key 记录时才会导入。</li>
+            </ul>
+          </section>
         </div>
         <div class="panel-actions">
           <p>API Key 模式为稳定首选；ChatGPT、Claude、Copilot、xAI 与 Kiro 的账号 OAuth 适配会按平台标注实验级别。</p>
@@ -329,6 +343,13 @@
             <input id="custom-models-path" type="text" spellcheck="false" placeholder="/models" />
           </label>
           <label class="field">
+            <span>Responses 兼容模式</span><span class="field-note">不确定时使用函数兼容模式</span>
+            <select id="custom-compatibility-profile">
+              <option value="function_only">函数兼容 · 自动转换 Codex 工具</option>
+              <option value="native_codex">原生 Codex · 保留 Beta/多智能体协议</option>
+            </select>
+          </label>
+          <label class="field">
             <span>额度接口路径</span><span class="field-note">可留空；不同网关没有统一标准</span>
             <input id="custom-quota-path" type="text" spellcheck="false" placeholder="/account/quota" />
           </label>
@@ -344,7 +365,7 @@
           </details>
         </div>
         <div class="panel-actions">
-          <p>密钥写入 0600 本机配置；环境变量优先，所有接口路径固定同源。</p>
+          <p>函数兼容模式会双向转换 tool_search、custom tool 和 namespace；原生模式只用于明确支持完整 Codex Responses 的网关。</p>
           <button class="primary-button" id="save-custom" type="button">应用第三方配置</button>
         </div>
       </section>
@@ -364,22 +385,42 @@
               <div><dt>目标配置</dt><dd id="codex-config-path">—</dd></div>
               <div><dt>最近备份</dt><dd id="codex-backup-path">—</dd></div>
               <div><dt>轮转日志</dt><dd id="switchboard-log-path">—</dd></div>
+              <div><dt>智能体模式</dt><dd id="codex-agent-status">等待检查</dd></div>
               <div><dt>安全状态</dt><dd id="codex-config-integrity">等待检查</dd></div>
             </dl>
           </div>
           <div class="confirm-box">
+            <div class="agent-config-box">
+              <label class="field">
+                <span>智能体配置</span>
+                <span class="field-note">只控制子智能体，不关闭普通工具</span>
+                <select id="codex-agent-mode">
+                  <option value="single" selected>单智能体（推荐）</option>
+                  <option value="limited">有限并行（最多 2 个线程）</option>
+                  <option value="parallel">并行模式（最多 4 个线程）</option>
+                  <option value="custom">自定义并发</option>
+                </select>
+              </label>
+              <label class="field" id="codex-agent-custom-field" hidden>
+                <span>最大并发线程</span>
+                <span class="field-note">1–16</span>
+                <input id="codex-agent-max-threads" type="number" min="1" max="16" step="1" value="4" />
+              </label>
+              <p class="agent-mode-summary" id="codex-agent-mode-summary">关闭 spawn_agent 等多智能体工具；终端、文件编辑、浏览器等普通工具照常可用。</p>
+            </div>
             <label class="field">
               <span>操作确认</span>
-              <span class="field-note">启用输入 ENABLE；关闭并恢复输入 RESTORE</span>
-              <input id="codex-confirmation" type="text" autocomplete="off" spellcheck="false" placeholder="ENABLE / RESTORE" />
+              <span class="field-note">启用输入 ENABLE；单独更新智能体输入 APPLY；关闭输入 RESTORE</span>
+              <input id="codex-confirmation" type="text" autocomplete="off" spellcheck="false" placeholder="ENABLE / APPLY / RESTORE" />
             </label>
             <div class="inline-buttons">
               <button class="primary-button" id="enable-codex-config" type="button">备份并启用代理</button>
+              <button class="secondary-button" id="apply-codex-agent-config" type="button">应用智能体配置</button>
               <button class="danger-button" id="disable-codex-config" type="button">关闭代理</button>
             </div>
           </div>
         </div>
-        <p class="warning-copy">关闭时只校验并恢复 Switchboard 接管的字段；Codex 自动更新的插件、市场、桌面字段以及你的其他编辑都会保留。</p>
+        <p class="warning-copy">关闭时只校验并恢复 Switchboard 接管的模型连接与智能体字段；Codex 自动更新的插件、市场、桌面字段以及你的其他编辑都会保留。</p>
       </section>
 
       <section class="panel inspector-panel">

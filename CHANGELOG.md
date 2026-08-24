@@ -6,6 +6,55 @@ All notable changes are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- One-click, preview-first import of compatible accounts from Pi's fixed
+  `~/.pi/agent/auth.json` credential file. The allow-listed mapper supports
+  Kiro, Cursor API-key records, OpenAI, ChatGPT Codex, Anthropic, GitHub
+  Copilot, xAI, and OpenRouter without adding a Pi/Node runtime dependency.
+- A safe default that skips existing Switchboard credentials and environment
+  overrides, plus an explicit browser-confirmed overwrite option. Import
+  results and previews never serialize credential values.
+- Codex-compatible Responses WebSocket lanes: FIFO ordering within a stream,
+  concurrent named streams, explicit lane-local cancellation, request-scoped
+  stream IDs, and bounded branching `previous_response_id` lineage.
+- Dashboard single-agent, fixed two/four-thread, and custom multi-agent modes,
+  with confirmed live `APPLY` and field-level Codex config restoration.
+- A transport-independent Responses compatibility layer with explicit
+  `native_codex`, `function_only`, and `prompt_bridge` capability profiles.
+  It discovers static, additional, and tool-search-provided tools; preserves or
+  reversibly lowers custom tools and namespaces; and restores streamed events.
+- Profile-gated `POST /v1/responses/compact`, native multi-agent beta/header
+  forwarding, and custom-provider compatibility selection in the dashboard.
+
+### Fixed
+
+- Kiro Direct now recognizes Codex `NEW_TASK` and `FINAL_ANSWER` inter-agent
+  envelopes, keeps delegated task payloads out of inherited parent turns, and
+  renders semantic `blocked` or `failed` outcomes as explicit final messages
+  without mislabeling them as transport-level `response.failed` events.
+- Running Codex Code Mode commands are continued through their existing
+  `write_stdin` session before another Kiro inference. The adapter preserves
+  nested command results, prevents duplicate relaunches, and keeps genuine
+  upstream/protocol failures as terminal `response.failed` events.
+
+- Repeated Codex subagent control loops now stop locally across every provider
+  after bounded interrupt/restart cycles. Bridge prompts explain the lifecycle,
+  new user work resets the guard, and redacted logs contain no agent names or
+  tool payloads.
+- New WebSocket `response.create` frames no longer cancel an active response
+  implicitly; provider selection is captured at queue admission and connection
+  teardown deterministically reaps receive and provider tasks.
+- HTTP and WebSocket streams now forward only complete JSON events and convert
+  provider exceptions, malformed/truncated events, or premature EOF after a
+  stream starts into one terminal `response.failed`. Direct providers also
+  recognize `response.incomplete` and top-level `error` as terminal events.
+- Stateless continuation fallback now verifies matching context for function,
+  custom, shell, tool-search, and MCP outputs before removing a foreign
+  `previous_response_id`. Hosted native multi-agent requests retain provider
+  agent events and bypass the local lifecycle guard; `agent_message` progress
+  resets that guard for compatibility providers.
+
 ## [0.2.1] - 2026-08-14
 
 ### Fixed

@@ -25,9 +25,13 @@ REQUIRED_WHEEL_SUFFIXES = (
 REQUIRED_SDIST_SUFFIXES = (
     "/LICENSE",
     "/README.md",
+    "/README.zh-CN.md",
+    "/RELEASING.md",
+    "/RELEASING.zh-CN.md",
     "/demo_config.toml",
     "/pyproject.toml",
 )
+FORBIDDEN_ARCHIVE_SUFFIXES = ("/AGENTS.md",)
 
 
 def _safe_member_name(name: str) -> bool:
@@ -131,6 +135,14 @@ def _missing_suffixes(names: set[str], required: tuple[str, ...]) -> list[str]:
     ]
 
 
+def _forbidden_suffixes(names: set[str]) -> list[str]:
+    return [
+        suffix
+        for suffix in FORBIDDEN_ARCHIVE_SUFFIXES
+        if any(name.endswith(suffix) for name in names)
+    ]
+
+
 def main() -> int:
     directory = Path(sys.argv[1]) if len(sys.argv) == 2 else Path("dist")
     wheels = sorted(directory.glob("*.whl"))
@@ -157,6 +169,10 @@ def main() -> int:
         findings.extend(
             ("required source member missing", f"{sdist.name}!{suffix}", None)
             for suffix in _missing_suffixes(names, REQUIRED_SDIST_SUFFIXES)
+        )
+        findings.extend(
+            ("forbidden source member present", f"{sdist.name}!{suffix}", None)
+            for suffix in _forbidden_suffixes(names)
         )
 
     if findings:

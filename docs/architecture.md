@@ -8,10 +8,11 @@ real provider request.
 
 | Layer | Responsibility | May depend on |
 | --- | --- | --- |
+| `compatibility` | provider capability profiles, Responses tool lowering/restoration, SSE framing | standard library |
 | `domain` | Responses objects, SSE events, bridge envelopes, task-key hashing | standard library |
-| `application` | active-provider routing, readiness, safe status, inspection | domain, provider ports |
-| `providers` | Kiro/Cursor workflows, native direct adapters, custom Responses relay | domain, infrastructure ports |
-| `infrastructure` | filesystem/backup state, CLI subprocesses, HTTP/SSE/event-stream clients | domain models where required |
+| `application` | active-provider routing, capabilities, readiness, safe status, inspection | compatibility, domain, provider ports |
+| `providers` | Kiro/Cursor workflows, native direct adapters, custom Responses relay | compatibility, domain, infrastructure ports |
+| `infrastructure` | filesystem/backup state, CLI subprocesses, HTTP/SSE/event-stream clients | compatibility and domain models where required |
 | `web` | authentication, origin/Host checks, JSON limits, HTTP/WebSocket responses, UI | application |
 | `runtime.py` | dependency construction | every concrete adapter |
 
@@ -51,6 +52,43 @@ sequenceDiagram
 
 Provider choice is sampled once at request start. A dashboard change therefore
 affects subsequent requests without mutating an in-flight stream.
+
+## Responses compatibility boundary
+
+The compatibility boundary follows the same useful separation found in mature
+API gateways such as [`sub2api`](https://github.com/Wei-Shaw/sub2api): normalize
+the client contract, execute one provider transport, then restore the client
+contract. Switchboard implements that design independently in Python and does
+not import or execute `sub2api`.
+Provider-specific rewrites do not live in FastAPI routes or in the scheduler.
+
+| Profile | Used by | Request behavior |
+| --- | --- | --- |
+| `native_codex` | OpenAI API, ChatGPT Codex, explicitly opted-in custom gateways | Preserve native custom tools, `tool_search`, namespaces, multi-agent fields, lineage headers, and remote compaction |
+| `function_only` | xAI, OpenRouter, GitHub Copilot, default custom gateways | Lower client custom/discovered/namespaced tools to deterministic functions and restore their Responses item/event shapes |
+| `prompt_bridge` | Kiro, Cursor, Anthropic bridge paths | Render the effective tool catalog into a nonce-protected prompt and accept only one fully validated result envelope |
+
+The effective tool catalog is assembled from top-level `tools`, Codex
+`additional_tools` input items, and completed `tool_search_output` discovery
+items. Namespace names are flattened collision-safely only for providers that
+need function lowering, and are restored before Codex sees the call. Custom-tool
+and tool-search arguments are buffered until a complete JSON value is available;
+partial internal function syntax is never emitted as client SSE.
+
+Continuation validation covers function, custom, local-shell, tool-search, MCP,
+and `item_reference` items. A stateless provider may drop a foreign
+`previous_response_id` only when every new tool output has matching call context;
+otherwise the request fails explicitly instead of corrupting the tool chain.
+Native profiles retain the original namespace and discovery shapes and forward
+only an allow-list of Codex lineage headers. Native multi-agent requests add the
+official `responses_multi_agent=v1` beta token while preserving any unrelated
+caller beta tokens.
+
+`POST /v1/responses/compact` is routed only to native profiles. Explicit compact
+requests are rejected in hosted multi-agent mode because each hosted agent owns
+and compacts its own context. Prompt-bridge and function-only routes continue to
+use Switchboard's bounded local history reduction and never forge an opaque
+native `compaction` item.
 
 ## Bridge protocol
 
@@ -148,6 +186,16 @@ Codex currently gives a main task and each subagent different metadata thread
 IDs even when an agent tree shares another cache key. Preferring the metadata
 thread ID prevents a subagent from resuming its parent's Kiro session.
 
+Before provider dispatch, the service examines only the active turn's typed
+tool-call metadata for repeated subagent control cycles. A new user message or
+substantive non-control call resets the observation window. One deliberate
+interrupt/restart correction remains valid; repeated
+`interrupt_agent -> followup_task -> interrupt_agent` cycles, identical mutating
+control calls, or sustained `list_agents` polling produce a local
+`response.completed` message instead of another upstream inference. This guard
+is shared by HTTP and WebSocket transports and never logs tool payloads or raw
+agent names.
+
 Cursor adds both the selected backend and model/parameter fingerprint to its
 mapping key. Switching between CLI and Cloud API, or changing a model variant,
 therefore creates an independent mapping.
@@ -184,20 +232,35 @@ replacement.
   to removing only recorded routing values that still match. Default takeover
   uses a dedicated provider whose display
   name is not `OpenAI`; this prevents Codex from inferring native remote
-  compaction support that the bridge does not implement.
+  compaction support while Kiro/Cursor prompt bridges are selected.
 - The WebSocket adapter decodes only complete JSON SSE records from providers
   before emitting one JSON text frame per Responses event.
-- Its in-flight receive task is retained across a completed response, so an
-  immediate tool result or continuation cannot be lost in a cancellation race.
-- The WebSocket adapter retains one bounded previous-response state per
-  connection. Matching `previous_response_id` turns are reconstructed from the
-  prior request, prior output, and new input before fingerprint/session routing;
-  uncached IDs fail explicitly instead of silently losing context.
-- Native `compaction_trigger` input is rejected before provider dispatch. The
-  managed non-OpenAI provider identity prevents Codex from sending it during
-  normal operation.
+- WebSocket routing and lineage are independent: `stream_id` selects a FIFO
+  lane, while `previous_response_id` selects cached response state. The default
+  lane and each named lane never self-overlap; distinct named lanes may run in
+  parallel up to the connection-wide 16-response limit. Named events echo their
+  stream ID, and no `response.create` implicitly cancels another response.
+- The WebSocket adapter retains a byte- and count-bounded LRU of response states
+  per connection. Matching `previous_response_id` turns are reconstructed from
+  the prior request, prior output, and new input before fingerprint/session
+  routing; this allows branching lineage, while evicted IDs fail explicitly
+  instead of silently losing context.
+- `response.cancel` is an explicit lane-local interruption. Connection teardown
+  cancels all active and queued work and deterministically reaps receive, lane,
+  and provider tasks, so no provider process survives a disconnected client.
+- Both HTTP SSE and WebSocket transports recognize `response.completed`,
+  `response.failed`, `response.incomplete`, and `error` as terminal. Once a
+  stream has started, malformed JSON, truncated records, provider exceptions,
+  and premature EOF become a terminal `response.failed` instead of a bare
+  disconnect that Codex could retry indefinitely.
+- Provider selection is snapshotted when a WebSocket request enters its lane;
+  later dashboard changes affect only newly accepted requests.
+- Native `compaction_trigger` input and `/responses/compact` are accepted only
+  for a `native_codex` upstream. Other profiles reject them before provider
+  dispatch; the managed non-OpenAI identity prevents normal Kiro/Cursor tasks
+  from selecting that protocol accidentally.
 - WebSocket `generate: false` prewarm is completed locally and installed as
-  that same connection-local state, so a prewarm never starts a duplicate
+  connection-local cached state, so a prewarm never starts a duplicate
   Kiro/Cursor inference.
 - The HTTP adapter accepts identity, gzip, deflate, and zstd request bodies,
   enforcing the configured limit both before and during decompression.
@@ -222,13 +285,34 @@ on returned tool calls and reused consistently in tool-result continuations.
 Kiro Direct also advertises a collision-safe internal final-answer tool whose
 description carries the terminal-action contract without modifying the user's
 message. Plain assistant text is treated as commentary until Kiro either calls
-a real Codex tool or submits its complete answer through that internal tool. A
-plain-text EOF receives one bounded corrective continuation; a repeated
-incomplete EOF is reported as a terminal failure instead of a false
-`response.completed`.
+a real Codex tool or submits its outcome and answer through that internal tool.
+All three semantic outcomes produce a protocol-complete final message;
+`blocked` and `failed` are visibly labeled for the user but are not represented
+as transport failures. A real upstream/protocol failure still produces
+`response.failed`. This distinction prevents Codex from presenting a valid
+agent status as `stream disconnected before completion`.
 
-There is no Pi package, Node worker, plugin loader, or provider subprocess in
-this path. External projects were used as interoperability research only.
+When a Codex custom `exec` tool result contains a `session_id` without a numeric
+`exit_code`, Switchboard emits a safe client-owned `write_stdin` tool call before
+asking Kiro for another action. Polling repeats until the command exits. The
+original command is never relaunched, and a discarded handle such as
+`exit_code=undefined` is called out in the direct-provider guidance. A
+plain-text EOF receives one bounded corrective continuation; a repeated
+incomplete EOF is reported as a terminal failure instead of a false successful
+completion.
+
+Codex inter-agent `agent_message` items are normalized separately from ordinary
+messages. A trailing `NEW_TASK` envelope is a hard current-turn boundary, and
+its delegated payload is extracted only from that item type. This prevents a
+forked Kiro Direct child from resuming an inherited parent task; opaque
+`reasoning.encrypted_content` is never treated as prompt text. `FINAL_ANSWER`
+envelopes are preserved as labeled child results for the parent.
+
+There is no Pi package, Node worker, plugin loader, or Pi provider subprocess in
+this path. External projects were used as interoperability research only. The
+optional Pi integration is a local credential-source adapter, not a provider:
+it parses an allow-listed subset of Pi's fixed auth-file schema only when the
+user requests a preview or import.
 Cursor is intentionally not in this catalog: its supported paths remain the
 official local CLI and optional Cloud Agents API because unofficial internal
 RPC adapters would broaden the security and compatibility boundary.
@@ -238,10 +322,12 @@ locked, written atomically, symlink-resistant, and never serialized to the
 control plane. The web layer receives only configured/source/type/expiry
 metadata. OAuth login sessions are bounded, retained briefly in memory, and
 cancelled during application shutdown. A second login request for the same
-platform reuses its active session. Explicit Pi-to-Kiro import reads only the
-fixed `~/.pi/agent/auth.json` source with byte, regular-file, and symlink
-checks; after validation it cancels any waiting Kiro login before atomically
-storing the imported credential.
+platform reuses its active session. Switchboard never reads Codex's
+`~/.codex/auth.json`, Kiro CLI storage, or Cursor application storage. The
+optional Pi importer reads only `~/.pi/agent/auth.json`, rejects caller-provided
+paths and unsafe file metadata, never serializes secret values, and writes valid
+copies through the same atomic Switchboard stores. Existing values are skipped
+by default, and an environment credential cannot be overwritten.
 
 ## Stored data
 

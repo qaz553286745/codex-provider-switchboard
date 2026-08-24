@@ -15,7 +15,21 @@ from typing import Any
 import httpx
 
 from .. import __version__
-from ..domain.bridge import collect_request_tools
+from ..compatibility.profiles import compatibility_profile
+from ..compatibility.responses import (
+    ResponsesCompatibilityError,
+    ResponsesStreamRestorer,
+    adapt_responses_request,
+    analyze_tool_continuation_coverage,
+    forwarded_codex_headers,
+    prepare_compaction_request,
+    promote_additional_tools,
+)
+from ..compatibility.sse import (
+    ResponsesSSEDecoder,
+    ResponsesSSEError,
+    encode_response_event,
+)
 from ..settings import AppSettings
 from .config_store import ConfigStore
 from .direct_catalog import curated_models, direct_platform
@@ -70,57 +84,6 @@ class DirectAPIError(RuntimeError):
     def __init__(self, message: str, *, status_code: int | None = None) -> None:
         super().__init__(message)
         self.status_code = status_code
-
-
-class _SSEDecoder:
-    separator = re.compile(rb"\r?\n\r?\n")
-
-    def __init__(self) -> None:
-        self.buffer = bytearray()
-
-    def feed(self, chunk: bytes) -> list[dict[str, Any]]:
-        self.buffer.extend(chunk)
-        if len(self.buffer) > _MAX_SSE_EVENT_BYTES:
-            raise DirectAPIError("Upstream SSE event exceeded the byte limit.")
-        result: list[dict[str, Any]] = []
-        while match := self.separator.search(self.buffer):
-            block = bytes(self.buffer[: match.start()])
-            del self.buffer[: match.end()]
-            event = self._decode(block)
-            if event is not None:
-                result.append(event)
-        return result
-
-    @staticmethod
-    def _decode(block: bytes) -> dict[str, Any] | None:
-        try:
-            lines = block.decode("utf-8").splitlines()
-        except UnicodeDecodeError as exc:
-            raise DirectAPIError("Upstream SSE was not valid UTF-8.") from exc
-        data: list[str] = []
-        for line in lines:
-            if line.startswith("data:"):
-                part = line[5:]
-                data.append(part[1:] if part.startswith(" ") else part)
-        if not data or data == ["[DONE]"]:
-            return None
-        try:
-            value = json.loads("\n".join(data))
-        except (json.JSONDecodeError, ValueError, RecursionError) as exc:
-            raise DirectAPIError("Upstream SSE event was not valid JSON.") from exc
-        if not isinstance(value, dict) or not isinstance(value.get("type"), str):
-            raise DirectAPIError("Upstream SSE event had an invalid shape.")
-        return value
-
-    def finish(self) -> None:
-        if self.buffer.strip():
-            raise DirectAPIError("Upstream SSE ended with an incomplete event.")
-
-
-def encode_response_event(event: dict[str, Any]) -> bytes:
-    event_type = str(event.get("type") or "response.event")
-    data = json.dumps(event, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
-    return f"event: {event_type}\ndata: {data}\n\n".encode()
 
 
 class _KiroEventDecoder:
@@ -295,13 +258,26 @@ class DirectClient:
                 headers["x-api-key"] = credential.token
             return headers
         headers["Authorization"] = f"Bearer {credential.token}"
+        capabilities = compatibility_profile(
+            direct_platform(platform_id).compatibility_profile
+        )
+        forwarded = (
+            forwarded_codex_headers(body or {})
+            if capabilities.forward_codex_headers
+            else {}
+        )
+        for name, value in forwarded.items():
+            if name != "OpenAI-Beta":
+                headers[name] = value
+
+        beta_features: list[str] = []
         if platform_id == "openai_codex":
             account_id = credential.extra.get("account_id")
             if not isinstance(account_id, str) or not account_id:
                 raise DirectAPIError("ChatGPT credential has no account ID.")
             headers["chatgpt-account-id"] = account_id
             headers["originator"] = "codex-provider-switchboard"
-            headers["OpenAI-Beta"] = "responses=experimental"
+            beta_features.append("responses=experimental")
         elif platform_id == "github_copilot":
             headers.update(
                 {
@@ -314,6 +290,23 @@ class DirectClient:
                     "X-Initiator": DirectClient._copilot_initiator(body or {}),
                 }
             )
+        forwarded_beta = forwarded.get("OpenAI-Beta")
+        if forwarded_beta:
+            beta_features.extend(forwarded_beta.split(","))
+        multi_agent = (body or {}).get("multi_agent")
+        if (
+            capabilities.native_multi_agent
+            and isinstance(multi_agent, dict)
+            and multi_agent.get("enabled") is True
+        ):
+            beta_features.append("responses_multi_agent=v1")
+        normalized_beta: list[str] = []
+        for feature in beta_features:
+            feature = feature.strip()
+            if feature and feature not in normalized_beta:
+                normalized_beta.append(feature)
+        if normalized_beta:
+            headers["OpenAI-Beta"] = ", ".join(normalized_beta)
         return headers
 
     @staticmethod
@@ -325,6 +318,9 @@ class DirectClient:
         if isinstance(last, dict) and last.get("type") in {
             "function_call_output",
             "custom_tool_call_output",
+            "local_shell_call_output",
+            "tool_search_output",
+            "mcp_tool_call_output",
         }:
             return "agent"
         return "user"
@@ -372,33 +368,20 @@ class DirectClient:
 
     def _responses_payload(
         self, body: dict[str, Any], platform_id: str, model_id: str, *, stream: bool
-    ) -> dict[str, Any]:
-        payload = dict(body)
+    ) -> tuple[dict[str, Any], ResponsesStreamRestorer | None]:
+        platform = direct_platform(platform_id)
+        capabilities = compatibility_profile(platform.compatibility_profile)
+        adapted = adapt_responses_request(body, capabilities)
+        payload = (
+            promote_additional_tools(adapted.body)
+            if platform_id == "openai"
+            else adapted.body
+        )
         payload.pop("client_metadata", None)
         payload.pop("generate", None)
         payload["model"] = model_id
         payload["stream"] = stream
-        if platform_id != "openai_codex":
-            input_value = payload.get("input")
-            if isinstance(input_value, list):
-                payload["input"] = [
-                    item
-                    for item in input_value
-                    if not (
-                        isinstance(item, dict)
-                        and item.get("type") == "additional_tools"
-                    )
-                ]
-            tools = collect_request_tools(body)
-            if tools:
-                payload["tools"] = [
-                    {
-                        key: value
-                        for key, value in tool.items()
-                        if key not in {"_namespace", "_wire_name"}
-                    }
-                    for tool in tools
-                ]
+        if capabilities.requires_function_lowering:
             payload.pop("reasoning_effort", None)
         if platform_id in {"openai_codex", "openrouter"}:
             payload["store"] = False
@@ -417,8 +400,19 @@ class DirectClient:
             # OpenRouter's Responses implementation is stateless. The caller already
             # supplies reconstructed history, so forwarding a foreign response id is
             # both unnecessary and error-prone.
+            coverage = analyze_tool_continuation_coverage(body)
+            if coverage.has_outputs and not coverage.context_covers_all_call_ids:
+                raise DirectAPIError(
+                    "OpenRouter continuation contains tool outputs without matching "
+                    "call context; refusing to remove previous_response_id because "
+                    "that would corrupt the tool chain.",
+                    status_code=400,
+                )
             payload.pop("previous_response_id", None)
-        return payload
+        restorer = (
+            None if adapted.mapping.empty else ResponsesStreamRestorer(adapted.mapping)
+        )
+        return payload, restorer
 
     async def stream_responses(self, body: dict[str, Any]) -> AsyncIterator[bytes]:
         platform_id, model_id, timeout_seconds = self.selection()
@@ -430,9 +424,11 @@ class DirectClient:
         except OAuthError as exc:
             raise DirectAPIError(str(exc)) from exc
         base_url = self._base_url(platform_id, credential)
-        payload = self._responses_payload(body, platform_id, model_id, stream=True)
+        payload, restorer = self._responses_payload(
+            body, platform_id, model_id, stream=True
+        )
         headers = self._headers(platform_id, credential, stream=True, body=body)
-        decoder = _SSEDecoder()
+        decoder = ResponsesSSEDecoder(event_limit=_MAX_SSE_EVENT_BYTES)
         stream_bytes = 0
         terminal = False
         async with self._semaphore:
@@ -461,13 +457,26 @@ class DirectClient:
                                 f"{platform.name} stream exceeded the byte limit."
                             )
                         for event in decoder.feed(chunk):
-                            event_type = event["type"]
-                            if event_type in {"response.completed", "response.failed"}:
-                                terminal = True
-                            yield encode_response_event(event)
+                            restored_events = (
+                                restorer.restore(event)
+                                if restorer is not None
+                                else [event]
+                            )
+                            for restored in restored_events:
+                                event_type = restored["type"]
+                                if event_type in {
+                                    "response.completed",
+                                    "response.failed",
+                                    "response.incomplete",
+                                    "error",
+                                }:
+                                    terminal = True
+                                yield encode_response_event(restored)
                     decoder.finish()
             except DirectAPIError:
                 raise
+            except ResponsesSSEError as exc:
+                raise DirectAPIError(str(exc)) from exc
             except httpx.HTTPError as exc:
                 raise DirectAPIError(
                     f"{platform.name} request failed ({type(exc).__name__})."
@@ -476,6 +485,53 @@ class DirectClient:
             raise DirectAPIError(
                 f"{platform.name} stream ended before a terminal Responses event."
             )
+
+    async def compact_responses(self, body: dict[str, Any]) -> dict[str, Any]:
+        platform_id, model_id, timeout_seconds = self.selection()
+        platform = direct_platform(platform_id)
+        capabilities = compatibility_profile(platform.compatibility_profile)
+        if platform.protocol != "responses" or not capabilities.native_compaction:
+            raise DirectAPIError(
+                f"{platform.name} does not support native Responses compaction.",
+                status_code=400,
+            )
+        try:
+            payload = prepare_compaction_request(body, model=model_id)
+        except ResponsesCompatibilityError as exc:
+            raise DirectAPIError(str(exc), status_code=400) from exc
+        try:
+            credential = await self.auth.resolve(platform_id)
+        except OAuthError as exc:
+            raise DirectAPIError(str(exc)) from exc
+        base_url = self._base_url(platform_id, credential)
+        headers = self._headers(platform_id, credential, body=body)
+        path = f"{platform.response_path.rstrip('/')}/compact"
+        async with self._semaphore:
+            try:
+                async with (
+                    self._client(base_url, timeout_seconds) as client,
+                    client.stream(
+                        "POST", path, headers=headers, json=payload
+                    ) as response,
+                ):
+                    raw = await self._read_limited(response)
+            except httpx.HTTPError as exc:
+                raise DirectAPIError(
+                    f"{platform.name} compaction failed ({type(exc).__name__})."
+                ) from exc
+        if response.status_code >= 400:
+            raise self._error(response.status_code, raw, platform.name)
+        try:
+            value = json.loads(raw)
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
+            raise DirectAPIError(
+                f"{platform.name} returned invalid compaction JSON."
+            ) from exc
+        if not isinstance(value, dict):
+            raise DirectAPIError(
+                f"{platform.name} returned an unexpected compaction value."
+            )
+        return value
 
     async def stream_anthropic(
         self, payload: dict[str, Any]
@@ -489,7 +545,7 @@ class DirectClient:
             raise DirectAPIError(str(exc)) from exc
         platform = direct_platform(platform_id)
         headers = self._headers(platform_id, credential, stream=True)
-        decoder = _SSEDecoder()
+        decoder = ResponsesSSEDecoder(event_limit=_MAX_SSE_EVENT_BYTES)
         saw_start = False
         saw_stop = False
         stream_bytes = 0
@@ -534,6 +590,8 @@ class DirectClient:
                     decoder.finish()
             except DirectAPIError:
                 raise
+            except ResponsesSSEError as exc:
+                raise DirectAPIError(str(exc)) from exc
             except httpx.HTTPError as exc:
                 raise DirectAPIError(
                     f"Anthropic request failed ({type(exc).__name__})."

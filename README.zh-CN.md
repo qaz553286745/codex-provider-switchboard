@@ -1,14 +1,16 @@
 # Codex Provider Switchboard
 
-### 一个本地 Responses 地址，切换 CLI、原生平台与私有网关
+### 面向 Codex 的本地 AI Provider 反向代理与协议适配器
 
 | [快速开始](#快速开始) | [配置](docs/configuration.md) | [本地 API](docs/api.md) | [架构](docs/architecture.md) | [安全](SECURITY.md) | [贡献](CONTRIBUTING.md) |
 | --- | --- | --- | --- | --- | --- |
 
-[English](README.md)
+[English](https://github.com/qaz553286745/codex-provider-switchboard/blob/main/README.md) |
+[简体中文](https://github.com/qaz553286745/codex-provider-switchboard/blob/main/README.zh-CN.md)
 
-这是一个运行在本机的 OpenAI Responses 兼容控制层。Codex 始终连接同一个地址，
-你可以在网页中切换实际使用的 Provider：
+这是一个运行在本机的 OpenAI Responses 兼容反向代理与控制层。Codex 始终连接
+同一个地址，你可以在网页中切换实际使用的 Provider。它不是逐字节透传代理，还会
+进行协议转换、流式事件归一化，以及 Codex 任务与上游 Session 的绑定。
 
 - **Kiro CLI**：复用本机已经安装、登录的 `kiro-cli`。
 - **Cursor Agent CLI**：默认路径，支持真实 NDJSON 流式输出与本地会话续用。
@@ -26,10 +28,10 @@ Session/Agent 的一一对应。
 > 这是独立的社区适配器，与 OpenAI、Kiro/AWS、Cursor 没有隶属或官方支持关系。
 > 使用前请自行确认各厂家的服务条款、数据处理方式和计费规则。
 
-原生 Provider 是本仓库自己的实现：不会安装或导入 Pi、
-`@mariozechner/pi-ai`、Node Worker 或 Pi Provider 插件。Pi 的公开 Provider
-矩阵只用于产品调研；协议转换、凭据、流式传输和网页控制代码均由 Switchboard
-独立维护。
+Provider 代码由本仓库自己维护：不会安装或运行 Pi、
+`@mariozechner/pi-ai`、Node Worker 或 Pi Provider 插件。作为可选迁移能力，
+只有在用户点击后，Switchboard 才会读取固定的 `~/.pi/agent/auth.json`，把白名单
+内可验证的凭据复制到自己的存储中；Pi 只是凭据来源，不是运行时依赖。
 
 计费跟随当前选中的上游：选择 Kiro 时使用 `kiro-cli` 已登录账号的额度，选择
 Cursor 时使用 Cursor 账号额度，选择第三方时由第三方计费。Codex 仍负责任务编排
@@ -41,8 +43,13 @@ Cursor 时使用 Cursor 账号额度，选择第三方时由第三方计费。Co
 - 最终回答和工具执行前的简短进度说明分别使用 Codex `final_answer` 与
   `commentary` 阶段实时输出；真实的 `update_plan` 调用可驱动原生步骤进度，且
   不会暴露隐藏思维链。
+- 按 Provider 能力适配 Responses：原生 Codex 平台保留 custom tool、
+  `tool_search`、namespace、多智能体事件、血缘请求头与远程压缩；较窄的兼容网关
+  会进行可逆的 function 降级与结果还原，转换逻辑不会散落在 Web 路由中。
 - 同一个 Codex 任务会续用对应的 Kiro Session 或 Cursor Agent。
 - Codex 子 Agent 使用独立 `thread_id`，不会误用主任务的上游会话。
+- Kiro、Cursor 和其他 Provider 共用子 Agent 调度熔断：同一轮反复中断、唤醒或
+  轮询状态时，本机直接返回可见的终止消息，不再无限消耗上游额度。
 - 不同任务使用隔离工作目录；把 `KIRO_MAX_CONCURRENCY` 或
   `CURSOR_CLI_MAX_CONCURRENCY` 从保守默认值 `1` 调高后，可同时运行多个本地 CLI。
 - Bridge 会按 Codex 风格批处理工具：优先用一个自定义 exec 调用配合
@@ -59,13 +66,17 @@ Cursor 时使用 Cursor 账号额度，选择第三方时由第三方计费。Co
 - 原生平台优先读取官方模型目录；没有公开目录时使用小型、受控的兼容目录。
 - 原生平台凭据与普通配置分离：环境变量优先，页面提交的 Key/OAuth Token 原子
   写入独立 `0600` 文件。Switchboard 不读取、复制或覆盖 `~/.codex/auth.json`；
-  Kiro 直连可由用户显式从固定的 `~/.pi/agent/auth.json` 导入 Kiro OAuth
-  记录，接口拒绝任意文件路径。
+  也不会扫描未列入白名单的 Agent 私有文件。
+- Pi 账号支持“先预览、再一键导入”：可映射 Kiro、Cursor、OpenAI/ChatGPT
+  Codex、Anthropic、GitHub Copilot、xAI 与 OpenRouter。默认跳过已有凭据，只有
+  显式确认才覆盖，接口和日志都不会回显 Token。
 - 额度卡片读取 Kiro `/usage`；Cursor 严格按官方 API 能力显示 Key/单次用量并
   链接官方用量页；第三方额度支持端点与 JSON 字段映射。
 - Codex 配置接管要求显式确认：完整时间戳备份、字段级应用与恢复；受管字段漂移
   不会锁死关闭，备份丢失时也能保守移除代理路由，并保留 Codex 自动更新的插件、
   市场、桌面及其他字段。
+- 网页提供单智能体（推荐默认）、最多 2/4 线程和自定义并发模式。单智能体只写入
+  `[agents].enabled = false`，不会关闭终端、文件编辑、浏览器等普通工具。
 - Kiro/Cursor 的提示词绝对上限为 4 MiB；超长历史只按完整用户轮次裁剪，Cursor
   CLI 还会根据官方模型名称中的 272K/1M 容量应用更保守的动态预算；当前轮次绝不
   截断，仍超限时返回不会触发重连的终止错误。
@@ -77,7 +88,9 @@ Cursor 时使用 Cursor 账号额度，选择第三方时由第三方计费。Co
 - Codex HTTP 回退原生兼容带大小边界的 gzip、deflate 与 zstd，不改用户的压缩设置。
 - 默认只监听回环地址，并具备请求大小限制、输出大小限制、同源控制接口、
   安全响应头和不含提示词/工具正文的脱敏轮转日志。
-- 同时支持 Responses SSE 和 Codex 使用的 Responses WebSocket 传输。
+- 同时支持 Responses SSE 和 Codex 使用的 Responses WebSocket 传输：同一通道
+  FIFO、不同命名通道可并发、仅显式 `response.cancel` 才取消对应通道，并以有界
+  `previous_response_id` 缓存保持上下文血缘，不会因新请求隐式中断旧请求。
 
 ## 数据流
 
@@ -108,6 +121,8 @@ flowchart LR
 - 使用原生平台时：准备所选平台的 API Key，或在网页中完成账号登录。OpenAI、
   Anthropic、xAI、OpenRouter 的 API Key 路径优先作为稳定方案；订阅账号 OAuth
   与 Kiro 直连会明确标记为实验性。
+- Pi 不是必需依赖；如果 Pi 已经保存了兼容账号，可以从页面导入，而不启动 Pi、
+  不切换当前 Provider。
 
 Kiro 适配器主要面向 macOS 桌面环境，以复用本机 CLI 的登录状态；Python 服务
 本身没有绑定 macOS 专属框架。
@@ -137,18 +152,26 @@ API Key 提交后不会再次返回浏览器。默认保存在当前用户的应
 认证链接和安全状态，不会读回明文。Cursor 继续使用官方 `cursor-agent`（或可选的
 Cloud Agents API），不会内建第三方非官方的 Cursor 内部 RPC 插件。
 
-选择实验性的 Kiro 直连后，还可以点击“导入 Pi 的 Kiro 认证”。该操作只读取
-`~/.pi/agent/auth.json` 中的 `kiro` 记录，将凭据转换后写入 Switchboard 的
-独立凭据文件，并取消同平台仍在等待的旧登录；它不会自动切换当前活动 Provider。
+如果本机 Pi 已经登录，在“原生多平台连接”中先点击“扫描可导入账号”，确认脱敏
+预览后再点击“一键导入可用账号”。默认不会覆盖 Switchboard 已有凭据。Cursor
+只有在 Pi 中存在明确的 `cursor` 或 `cursor-agent` API Key 记录时才会导入，
+Switchboard 不会猜测或扫描其他 Cursor 文件。
 
 ## 配置 Codex
 
 网页可以安全接管**用户级** `~/.codex/config.toml`：输入 `ENABLE` 后先创建
-时间戳备份，再基于启用瞬间的当前文件只应用连接字段；关闭时输入 `RESTORE`，也只
-恢复这些受管字段。代理启用期间 Codex 自动更新的插件、市场、桌面字段和你的其他
+时间戳备份，再基于启用瞬间的当前文件只应用连接字段和页面选定的智能体模式；代理
+启用期间输入 `APPLY` 可以只更新智能体配置，关闭时输入 `RESTORE`，也只恢复这些
+受管字段。代理启用期间 Codex 自动更新的插件、市场、桌面字段和你的其他
 编辑都会保留。受管字段发生漂移时，关闭仍会把备份中的受管值合并进当前文件；若
 备份丢失或损坏，则只移除仍与接管记录一致的代理路由值，并保留当前模型。若代理
 路由已经在网页外被移除，陈旧的“已启用”状态会自动解除，不会阻塞下一次启用。
+
+新接管默认选择“单智能体”，对应 `[agents].enabled = false`。这只隐藏/关闭 Codex
+的多智能体工具，终端、文件编辑、浏览器等普通工具仍然可用。选择有限并行、并行或
+自定义模式时，页面才会管理 `agents.max_concurrent_threads_per_session`；关闭代理
+时，这些键和模型路由一样按字段恢复，不覆盖 `[plugins]`、`[marketplaces]`、
+`[desktop]` 等其他内容。
 
 接管期间不会修改 `features.enable_request_compression`。本地 HTTP 回退已经支持
 带边界校验的 gzip、deflate 和 zstd JSON 请求体，因此会原样保留你的压缩偏好以及
@@ -156,10 +179,12 @@ Cloud Agents API），不会内建第三方非官方的 Cursor 内部 RPC 插件
 
 当前配置使用默认 OpenAI Provider 时，网页会安装独立的
 `codex-provider-switchboard` Provider 身份。这是有意的：Codex 会把名称严格等于
-`OpenAI` 的 Provider 视为原生支持远程压缩，而本兼容层不会生成 OpenAI 的不透明
-compaction item。独立身份会让 Codex 使用正常的本地摘要路径，避免发送本工具无法
-满足的 `compaction_trigger` 请求。当前已经选择非保留的自定义 Provider 时，仍会
-保留该 Provider ID，仅临时接管其连接表。
+`OpenAI` 的 Provider 视为原生支持远程压缩，但同一个 Switchboard 地址此时可能
+切到 Kiro 或 Cursor。独立身份会让这些 Bridge 路径使用 Codex 的本地摘要，避免
+发送其无法满足的 `compaction_trigger`。选择 OpenAI 原生直连，或把第三方网关
+显式设为 `native_codex` 时，则可以使用能力门控的 `/responses/compact` 转发。
+当前已经选择非保留的自定义 Provider 时，仍会保留该 Provider ID，仅临时接管其
+连接表。
 
 最小手工配置是：
 
@@ -178,7 +203,8 @@ stream_max_retries = 0
 ```
 
 不要改写成 `openai_base_url`：当前 Codex 会因此把回环适配器判断成原生 OpenAI
-Provider，并启用本工具不支持的远程压缩。远程鉴权或直接第三方配置可参考
+Provider，即使当前上游是 Kiro、Cursor 或其他非原生网关也会启用远程压缩。远程
+鉴权或直接第三方配置可参考
 [`demo_config.toml`](demo_config.toml)。
 
 修改后新建或重启 Codex 任务。当前 Codex 会出于安全原因忽略项目级
@@ -285,6 +311,7 @@ instructions 与工具目录。随后即使会话复用把逻辑历史缩减为�
 ```text
 .
 ├── src/codex_provider_switchboard/
+│   ├── compatibility/   # Provider 能力画像与可逆 Responses 适配
 │   ├── domain/          # Responses 转换与严格 Bridge 协议
 │   ├── application/     # Provider 路由、状态与脱敏检查器
 │   ├── infrastructure/  # 配置、会话、子进程与 HTTP 客户端
@@ -313,12 +340,11 @@ uv run ruff check .
 uv run ruff format --check .
 uv run python scripts/check_repository.py
 uv run pytest --cov
-uv build
-uv run twine check dist/*
-uv run python scripts/check_artifacts.py dist
+uv run python scripts/build_release.py --python 3.11 --allow-dirty
 ```
 
-发布维护者还应执行 [RELEASING.md](RELEASING.md) 中的检查清单。
+发布维护者还应阅读[中文发布指南](https://github.com/qaz553286745/codex-provider-switchboard/blob/main/RELEASING.zh-CN.md)
+或 [English release guide](https://github.com/qaz553286745/codex-provider-switchboard/blob/main/RELEASING.md)。
 
 测试全部使用 Fake/MockTransport，不会读取真实 Cursor Key，也不会产生真实 API 用量。
 
@@ -331,8 +357,9 @@ uv run python scripts/check_artifacts.py dist
   只有上游模型实际调用 `update_plan` 时，Codex 才显示原生步骤进度；Switchboard
   不伪造隐藏推理或计划状态。
 - 已支持 Codex 的 Responses WebSocket 模式；不实现无关的 Realtime 音频 API。
-- 不实现 OpenAI 原生 remote-compaction 输出；应使用上面的独立 Provider 配置，
-  让 Codex 选择本地摘要路径。
+- 仅 `native_codex` 的原生直连/第三方 Provider 会转发远程压缩；Kiro、Cursor、
+  Prompt Bridge 与 function-only 网关会明确拒绝，并应使用上面的独立 Provider
+  配置走本地摘要。
 - Cursor CLI 与 Cloud Agents API 都不提供账户剩余额度；页面会明确标注该边界，
   验证当前后端，在可用时显示最近运行 Token，并链接 Cursor 官方用量页。
 - 上游 CLI/API 可能变化，需要持续跟进官方协议。

@@ -8,6 +8,7 @@ const state = {
   customModels: [],
   directModels: [],
   directPlatforms: [],
+  piPreview: null,
   directLoginId: null,
   directLoginTimer: null,
   busy: new Set(),
@@ -351,7 +352,28 @@ function renderLastRequest(last) {
   renderParamList($("#last-params"), params, last ? "未显式发送模型参数" : "等待首个请求");
 }
 
-function renderCodexConfig(config) {
+function syncCodexAgentControls() {
+  const mode = $("#codex-agent-mode").value;
+  $("#codex-agent-custom-field").hidden = mode !== "custom";
+  const summaries = {
+    single: "关闭 spawn_agent 等多智能体工具；终端、文件编辑、浏览器等普通工具照常可用。",
+    limited: "开启多智能体能力，并把单个任务的并发线程上限设为 2。",
+    parallel: "开启多智能体能力，并把单个任务的并发线程上限设为 4。",
+    custom: "开启多智能体能力，并使用你指定的单任务并发线程上限。",
+  };
+  $("#codex-agent-mode-summary").textContent = summaries[mode];
+}
+
+function codexAgentPayload() {
+  const agentMode = $("#codex-agent-mode").value;
+  const payload = { agent_mode: agentMode };
+  if (agentMode === "custom") {
+    payload.agent_max_threads = Number($("#codex-agent-max-threads").value);
+  }
+  return payload;
+}
+
+function renderCodexConfig(config, { preserveForm = false } = {}) {
   const badge = $("#codex-config-status");
   if (config.active && config.current_matches_managed) {
     badge.textContent = "代理接管中";
@@ -365,6 +387,23 @@ function renderCodexConfig(config) {
   }
   $("#codex-config-path").textContent = config.config_path || "—";
   $("#codex-backup-path").textContent = config.backup_path || "尚无备份";
+  const agents = config.agents || {};
+  const threadSummary = agents.max_concurrent_threads_per_session
+    ? ` · 并发上限 ${agents.max_concurrent_threads_per_session}`
+    : (agents.enabled ? " · Codex 默认并发" : "");
+  $("#codex-agent-status").textContent = agents.enabled
+    ? `多智能体已开启${threadSummary}${agents.managed ? " · Switchboard 管理" : ""}`
+    : `单智能体 · 普通工具可用${agents.managed ? " · Switchboard 管理" : ""}`;
+  if (!preserveForm) {
+    const mode = config.active && ["single", "limited", "parallel", "custom"].includes(agents.mode)
+      ? agents.mode
+      : "single";
+    $("#codex-agent-mode").value = mode;
+    if (mode === "custom" && agents.max_concurrent_threads_per_session) {
+      $("#codex-agent-max-threads").value = agents.max_concurrent_threads_per_session;
+    }
+  }
+  syncCodexAgentControls();
   if (!config.active) {
     $("#codex-config-integrity").textContent = config.restore_method === "external_detach"
       ? "已检测到代理路由在外部移除，状态已自动同步"
@@ -377,6 +416,7 @@ function renderCodexConfig(config) {
     $("#codex-config-integrity").textContent = "备份不可用；仍可关闭，届时仅清理 Switchboard 路由值";
   }
   $("#enable-codex-config").disabled = config.active;
+  $("#apply-codex-agent-config").disabled = !config.active;
   $("#disable-codex-config").disabled = !config.active;
 }
 
@@ -463,6 +503,7 @@ function renderState(payload, { preserveForm = false } = {}) {
     setInputValue("#custom-base-url", custom.base_url);
     setInputValue("#custom-model", custom.model_id);
     setInputValue("#custom-models-path", custom.models_path || "/models");
+    $("#custom-compatibility-profile").value = custom.compatibility_profile || "function_only";
     setInputValue("#custom-quota-path", custom.quota_path);
     setInputValue("#quota-total-field", custom.quota_total_field);
     setInputValue("#quota-used-field", custom.quota_used_field);
@@ -475,7 +516,7 @@ function renderState(payload, { preserveForm = false } = {}) {
 
   renderProvider(payload.settings.active_provider);
   renderLastRequest(payload.last_upstream_request);
-  renderCodexConfig(payload.codex_config);
+  renderCodexConfig(payload.codex_config, { preserveForm });
   const service = $("#service-pill");
   service.className = "service-pill ok";
   $("#service-label").textContent = `代理在线 · 当前 ${providerNames[payload.settings.active_provider]}`;
@@ -684,6 +725,7 @@ function customPayload(includeKey = true) {
     model_id: $("#custom-model").value.trim(),
     model_display_name: $("#custom-model").value.trim() || "Third-party default",
     models_path: $("#custom-models-path").value.trim() || "/models",
+    compatibility_profile: $("#custom-compatibility-profile").value,
     quota_path: $("#custom-quota-path").value.trim(),
     quota_total_field: $("#quota-total-field").value.trim(),
     quota_used_field: $("#quota-used-field").value.trim(),
@@ -847,6 +889,86 @@ async function importPiKiroCredentials() {
   } finally {
     state.busy.delete("direct-import");
     renderDirectControls($("#direct-platform").value);
+  }
+}
+
+function piTargetName(candidate) {
+  if (candidate.target_kind === "cursor") return "Cursor Agent";
+  return directPlatform(candidate.target_id)?.name || candidate.target_id;
+}
+
+function renderPiCredentialPreview(preview, imported = []) {
+  state.piPreview = preview;
+  const list = $("#pi-import-results");
+  list.replaceChildren();
+  const importedKeys = new Set(
+    imported.map((item) => `${item.target_kind}:${item.target_id}`),
+  );
+  const candidates = Array.isArray(preview?.candidates) ? preview.candidates : [];
+  if (!candidates.length) {
+    const item = document.createElement("li");
+    item.textContent = "Pi 中没有可安全映射到 Switchboard 的凭据。";
+    list.append(item);
+  }
+  candidates.forEach((candidate) => {
+    const item = document.createElement("li");
+    const key = `${candidate.target_kind}:${candidate.target_id}`;
+    const stateText = importedKeys.has(key)
+      ? "已导入"
+      : (candidate.configured ? `已配置（${candidate.configured_source}）` : "可导入");
+    item.textContent = `${candidate.source_provider} → ${piTargetName(candidate)} · ${candidate.credential_type} · ${stateText}`;
+    list.append(item);
+  });
+  const unsupported = Array.isArray(preview?.unsupported) ? preview.unsupported : [];
+  if (unsupported.length) {
+    const item = document.createElement("li");
+    item.textContent = `${unsupported.length} 个 Pi Provider 没有兼容映射，已安全跳过。`;
+    list.append(item);
+  }
+}
+
+async function scanPiCredentials() {
+  if (state.busy.has("pi-scan")) return;
+  state.busy.add("pi-scan");
+  const button = $("#scan-pi-auth");
+  button.disabled = true;
+  try {
+    const preview = await requestJSON("/api/control/imports/pi");
+    renderPiCredentialPreview(preview);
+    showToast(`发现 ${preview.candidates?.length || 0} 个可导入账号`);
+  } catch (error) {
+    showToast(error.message, true);
+  } finally {
+    state.busy.delete("pi-scan");
+    button.disabled = false;
+  }
+}
+
+async function importPiCredentials() {
+  if (state.busy.has("pi-import")) return;
+  const replaceExisting = $("#pi-import-replace").checked;
+  const action = replaceExisting ? "导入并覆盖已有凭据" : "导入尚未配置的凭据";
+  if (!window.confirm(`${action}？该操作只复制凭据，不会修改 Pi 的文件。`)) return;
+  state.busy.add("pi-import");
+  const button = $("#import-pi-auth");
+  button.disabled = true;
+  try {
+    const result = await requestJSON("/api/control/imports/pi", {
+      method: "POST",
+      body: JSON.stringify({ replace_existing: replaceExisting }),
+    });
+    renderState(result.state);
+    const preview = await requestJSON("/api/control/imports/pi");
+    renderPiCredentialPreview(preview, result.imported || []);
+    state.directModels = [];
+    state.cursorModels = [];
+    await Promise.allSettled([loadModels("direct", true), loadModels("cursor", true)]);
+    showToast(`已导入 ${result.imported?.length || 0} 个账号，跳过 ${result.skipped?.length || 0} 个`);
+  } catch (error) {
+    showToast(error.message, true);
+  } finally {
+    state.busy.delete("pi-import");
+    button.disabled = false;
   }
 }
 
@@ -1029,7 +1151,7 @@ async function codexConfigAction(action) {
   button.disabled = true;
   try {
     const body = action === "enable"
-      ? { confirmation, model: activeProxyModel() }
+      ? { confirmation, model: activeProxyModel(), ...codexAgentPayload() }
       : { confirmation };
     const payload = await requestJSON(`/api/control/codex-config/${action}`, {
       method: "POST",
@@ -1052,6 +1174,32 @@ async function codexConfigAction(action) {
   } finally {
     const config = state.payload.codex_config;
     $("#enable-codex-config").disabled = config.active;
+    $("#apply-codex-agent-config").disabled = !config.active;
+    $("#disable-codex-config").disabled = !config.active;
+  }
+}
+
+async function applyCodexAgentConfig() {
+  const confirmation = $("#codex-confirmation").value.trim();
+  const button = $("#apply-codex-agent-config");
+  button.disabled = true;
+  try {
+    const payload = await requestJSON("/api/control/codex-config/agents", {
+      method: "POST",
+      body: JSON.stringify({ confirmation, ...codexAgentPayload() }),
+    });
+    state.payload.codex_config = payload;
+    renderCodexConfig(payload);
+    $("#codex-confirmation").value = "";
+    showToast(payload.agents.enabled
+      ? `多智能体已开启，并发上限 ${payload.agents.max_concurrent_threads_per_session}`
+      : "已切换为单智能体；普通工具仍可使用");
+  } catch (error) {
+    showToast(error.message, true);
+  } finally {
+    const config = state.payload.codex_config;
+    $("#enable-codex-config").disabled = config.active;
+    $("#apply-codex-agent-config").disabled = !config.active;
     $("#disable-codex-config").disabled = !config.active;
   }
 }
@@ -1114,6 +1262,8 @@ function bindEvents() {
   });
   $("#save-direct-key").addEventListener("click", saveDirectKey);
   $("#import-pi-kiro").addEventListener("click", importPiKiroCredentials);
+  $("#scan-pi-auth").addEventListener("click", scanPiCredentials);
+  $("#import-pi-auth").addEventListener("click", importPiCredentials);
   $("#login-direct").addEventListener("click", startDirectLogin);
   $("#logout-direct").addEventListener("click", logoutDirect);
   $("#direct-login-respond").addEventListener("click", respondDirectLogin);
@@ -1156,7 +1306,9 @@ function bindEvents() {
     finally { button.disabled = false; }
   });
   $("#enable-codex-config").addEventListener("click", () => codexConfigAction("enable"));
+  $("#apply-codex-agent-config").addEventListener("click", applyCodexAgentConfig);
   $("#disable-codex-config").addEventListener("click", () => codexConfigAction("disable"));
+  $("#codex-agent-mode").addEventListener("change", syncCodexAgentControls);
   $("#copy-url").addEventListener("click", async () => {
     try {
       await navigator.clipboard.writeText(proxyBaseUrl());

@@ -5,6 +5,14 @@ model_provider = "codex-provider-switchboard"
 model = "gpt-5.6-sol"
 model_reasoning_effort = "max"
 
+# Recommended for ordinary tool use without Codex subagents. Terminal, file,
+# browser, and other normal tools remain available.
+[agents]
+enabled = false
+
+# To enable multi-agent work instead, set enabled = true and uncomment:
+# max_concurrent_threads_per_session = 2
+
 # Local switchboard: choose Kiro, Cursor, or a third-party API in the web UI.
 [model_providers.codex-provider-switchboard]
 name = "Local Codex Provider Switchboard"

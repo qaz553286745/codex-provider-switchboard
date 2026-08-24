@@ -10,7 +10,9 @@ from typing import Any
 
 from ..application.inspector import RequestInspector
 from ..domain.direct_bridge import (
+    analyze_tool_continuation,
     encode_anthropic_signature,
+    find_exec_tool_alias,
     responses_to_anthropic,
     responses_to_kiro,
     responses_usage,
@@ -25,6 +27,7 @@ from .base import ProviderError, ProviderResponse
 logger = logging.getLogger(__name__)
 
 _KIRO_FINAL_TOOL_PREFIX = "switchboard_submit_final_answer"
+_KIRO_FINAL_OUTCOMES = frozenset({"completed", "blocked", "failed"})
 _KIRO_MAX_ATTEMPTS = 2
 _KIRO_CONTINUATION_PROMPT = (
     "Your previous response ended without either requesting a tool or submitting "
@@ -32,6 +35,21 @@ _KIRO_CONTINUATION_PROMPT = (
     "reported. Use a normal tool if more work is required; otherwise submit the "
     "complete answer with the Switchboard final-answer tool."
 )
+
+
+def _kiro_background_poll_input(session_id: int) -> str:
+    """Return side-effect-free Code Mode JavaScript for one existing process."""
+
+    return (
+        "const r = await tools.write_stdin({"
+        f'session_id: {session_id}, chars: "", yield_time_ms: 30000, '
+        "max_output_tokens: 30000}); text(JSON.stringify(r));"
+    )
+
+
+def _kiro_semantic_terminal_answer(outcome: str, answer: str) -> str:
+    label = "blocked" if outcome == "blocked" else "could not be completed"
+    return f"[provider-switchboard] Task {label}: {answer.strip()}"
 
 
 def _install_kiro_completion_protocol(
@@ -60,22 +78,33 @@ def _install_kiro_completion_protocol(
             "toolSpecification": {
                 "name": name,
                 "description": (
-                    "Required terminal action for a completed turn. Plain assistant "
-                    "text is progress commentary and never completes the turn. If "
-                    "more work is required, call a normal tool. Only when the user's "
-                    "task is fully finished, call this tool exactly once with the "
-                    "complete user-facing final answer. Do not use it for progress."
+                    "Required terminal action for a turn. Plain assistant text is "
+                    "progress commentary and never completes the turn. If more work "
+                    "is required, call a normal tool. When work stops, call this tool "
+                    "exactly once: use outcome=completed only when the user's task is "
+                    "fully finished; otherwise use blocked or failed and explain the "
+                    "reason. Do not report an apology or incomplete run as completed."
                 ),
                 "inputSchema": {
                     "json": {
                         "type": "object",
                         "properties": {
+                            "outcome": {
+                                "type": "string",
+                                "enum": ["completed", "blocked", "failed"],
+                                "description": (
+                                    "Whether the requested task was actually completed."
+                                ),
+                            },
                             "final_answer": {
                                 "type": "string",
-                                "description": "Complete user-facing final answer.",
-                            }
+                                "description": (
+                                    "User-facing result or a clear blocked/failure "
+                                    "reason."
+                                ),
+                            },
                         },
-                        "required": ["final_answer"],
+                        "required": ["outcome", "final_answer"],
                         "additionalProperties": False,
                     }
                 },
@@ -227,12 +256,24 @@ class DirectProvider:
                 event.get("response"), dict
             ):
                 terminal = event["response"]
-            elif event_type == "response.failed":
+            elif event_type in {"response.failed", "response.incomplete", "error"}:
                 response = event.get("response")
                 error = response.get("error") if isinstance(response, dict) else None
+                if not isinstance(error, dict):
+                    top_level_error = event.get("error")
+                    error = (
+                        top_level_error if isinstance(top_level_error, dict) else None
+                    )
                 message = error.get("message") if isinstance(error, dict) else None
                 raise ProviderError(
-                    str(message or "Direct provider request failed."),
+                    str(
+                        message
+                        or (
+                            "Direct provider response was incomplete."
+                            if event_type == "response.incomplete"
+                            else "Direct provider request failed."
+                        )
+                    ),
                     error_type="direct_provider_error",
                     status_code=502,
                 )
@@ -507,10 +548,40 @@ class DirectProvider:
     async def _stream_kiro(self, body: dict[str, Any]) -> AsyncIterator[bytes]:
         model = self.model_id()
         payload, catalog = responses_to_kiro(body, model)
+        lifecycle = ResponseEventStream(body, model, error_code="kiro_direct_error")
+        continuation = analyze_tool_continuation(body)
+        exec_alias = find_exec_tool_alias(catalog)
+        if continuation.pending_session_ids and exec_alias is not None:
+            # Codex owns this process and its unified-exec session. Polling it is
+            # deterministic and must happen before asking the upstream model for
+            # another action; otherwise models can relaunch the same long command
+            # or terminate while its result is still pending.
+            session_id = continuation.pending_session_ids[0]
+            poll_item = tool_item(
+                exec_alias,
+                {"input": _kiro_background_poll_input(session_id)},
+                f"switchboard-poll-{os.urandom(8).hex()}",
+                catalog,
+            )
+            if poll_item is None:  # pragma: no cover - alias came from this catalog.
+                raise DirectAPIError("Kiro exec continuation tool was unavailable.")
+            logger.info(
+                "Kiro Direct scheduled Codex background-tool continuation "
+                "pending_sessions=%d",
+                len(continuation.pending_session_ids),
+            )
+            for event in lifecycle.begin():
+                yield event
+            for event in lifecycle.completed_items([poll_item]):
+                yield event
+            usage = responses_usage()
+            self.last_usage = usage
+            yield lifecycle.completed([poll_item], usage)
+            return
+
         final_tool_name, current_message = _install_kiro_completion_protocol(
             payload, catalog
         )
-        lifecycle = ResponseEventStream(body, model, error_code="kiro_direct_error")
         for event in lifecycle.begin():
             yield event
 
@@ -728,6 +799,7 @@ class DirectProvider:
             finished_items[text_index or 0] = item
         completed_tools: list[dict[str, Any]] = []
         final_answer: str | None = None
+        final_outcome: str | None = None
         for state in tool_states:
             raw = state["partial"].strip() or "{}"
             try:
@@ -739,9 +811,15 @@ class DirectProvider:
             if not isinstance(arguments, dict):
                 raise DirectAPIError("Kiro returned non-object tool arguments.")
             if state["name"] == final_tool_name:
+                outcome = arguments.get("outcome")
+                if not isinstance(outcome, str) or outcome not in _KIRO_FINAL_OUTCOMES:
+                    raise DirectAPIError(
+                        "Kiro submitted a terminal answer without a valid outcome."
+                    )
                 candidate = arguments.get("final_answer")
                 if not isinstance(candidate, str) or not candidate.strip():
                     raise DirectAPIError("Kiro submitted an empty final answer.")
+                final_outcome = outcome
                 final_answer = candidate
                 continue
             item = tool_item(state["name"], arguments, state["id"], catalog)
@@ -754,6 +832,7 @@ class DirectProvider:
             # A normal tool call means the agent still has work to do. Never let a
             # conflicting internal-final call suppress that tool round.
             final_answer = None
+            final_outcome = None
             logger.info(
                 "Kiro Direct response completed terminal_action=client_tools "
                 "tool_count=%d commentary_chars=%d",
@@ -761,12 +840,24 @@ class DirectProvider:
                 len(text),
             )
         elif final_answer is not None:
-            logger.info(
-                "Kiro Direct response completed terminal_action=final_answer "
-                "final_chars=%d commentary_chars=%d",
-                len(final_answer),
-                len(text),
-            )
+            if final_outcome != "completed":
+                logger.warning(
+                    "Kiro Direct semantic terminal outcome=%s "
+                    "message_chars=%d commentary_chars=%d",
+                    final_outcome,
+                    len(final_answer),
+                    len(text),
+                )
+                final_answer = _kiro_semantic_terminal_answer(
+                    final_outcome or "failed", final_answer
+                )
+            else:
+                logger.info(
+                    "Kiro Direct response completed terminal_action=final_answer "
+                    "final_chars=%d commentary_chars=%d",
+                    len(final_answer),
+                    len(text),
+                )
             final_id = f"msg_{os.urandom(16).hex()}"
             final_index = next_output_index
             next_output_index += 1

@@ -10,6 +10,14 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
+from ..compatibility.responses import (
+    collect_request_tools as collect_compatible_request_tools,
+)
+from .agent_loop_guard import (
+    AGENT_ORCHESTRATION_GUIDANCE,
+    has_agent_control_tools,
+)
+
 _CSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _OSC_RE = re.compile(r"\x1b\][^\x07]*(?:\x07|\x1b\\)")
 _CREDIT_RE = re.compile(r"^\s*[▸>]?[ ]*Credits:\s*", re.IGNORECASE)
@@ -443,7 +451,11 @@ def _tool_catalog(
     for tool in tools:
         name = tool.get("name")
         tool_type = tool.get("type")
-        if isinstance(name, str) and tool_type in {"function", "custom"}:
+        if isinstance(name, str) and tool_type in {
+            "function",
+            "custom",
+            "tool_search",
+        }:
             wire_name = tool.get("_wire_name", name)
             namespace = tool.get("_namespace")
             if isinstance(wire_name, str) and (
@@ -454,59 +466,8 @@ def _tool_catalog(
 
 
 def collect_request_tools(body: dict[str, Any]) -> list[dict[str, Any]]:
-    """Collect standard Responses tools and Codex `additional_tools` entries."""
-    collected: list[dict[str, Any]] = []
-    seen: set[str] = set()
-
-    def add(candidate: Any, namespace: str | None = None) -> None:
-        if not isinstance(candidate, dict) or not isinstance(
-            candidate.get("name"), str
-        ):
-            return
-        wire_name = candidate["name"]
-        if not _SAFE_TOOL_NAME_RE.fullmatch(wire_name):
-            return
-        raw_type = candidate.get("type")
-        if raw_type == "namespace":
-            for child in candidate.get("tools") or []:
-                add(child, wire_name)
-            return
-        public_name = f"{namespace}.{wire_name}" if namespace else wire_name
-        if public_name in seen:
-            return
-        tool_type = "function" if raw_type == "function" else "custom"
-        normalized = {**candidate, "name": public_name, "type": tool_type}
-        if namespace:
-            normalized["_namespace"] = namespace
-            normalized["_wire_name"] = wire_name
-        collected.append(normalized)
-        seen.add(public_name)
-
-    for candidate in body.get("tools") or []:
-        add(candidate)
-
-    input_value = body.get("input")
-    if isinstance(input_value, list):
-        for item in input_value:
-            if not isinstance(item, dict) or item.get("type") != "additional_tools":
-                continue
-            # Codex extension shape can evolve. Only inspect list-valued fields on
-            # the explicitly typed additional_tools item, and only accept named maps.
-            for value in item.values():
-                if isinstance(value, list):
-                    for candidate in value:
-                        add(candidate)
-
-    if not collected:
-        instructions = body.get("instructions")
-        encoded = (
-            instructions
-            if isinstance(instructions, str)
-            else json.dumps(instructions, ensure_ascii=False)
-        )
-        if "FREEFORM" in encoded and re.search(r"\bexec\b", encoded):
-            add({"name": "exec", "type": "custom"})
-    return collected
+    """Compatibility wrapper for callers that historically imported this module."""
+    return collect_compatible_request_tools(body)
 
 
 _COMPACT_DROP_KEYS = frozenset({"annotations", "logprobs"})
@@ -567,20 +528,8 @@ def _compact_input(value: Any) -> Any:
 
 
 def _merged_request_tools(body: dict[str, Any]) -> list[dict[str, Any]]:
-    """Move Codex additional_tools into one deduplicated prompt catalog."""
-    configured = body.get("tools")
-    merged = list(configured) if isinstance(configured, list) else []
-    names = {
-        item.get("name")
-        for item in collect_request_tools({"tools": merged})
-        if isinstance(item, dict) and isinstance(item.get("name"), str)
-    }
-    for tool in collect_request_tools(body):
-        name = tool.get("name")
-        if name not in names:
-            merged.append(tool)
-            names.add(name)
-    return merged
+    """Return one prompt-ready catalog including dynamically discovered tools."""
+    return collect_request_tools(body)
 
 
 def _is_user_turn_boundary(item: Any) -> bool:
@@ -614,6 +563,8 @@ def _bridge_prompt_text(
         "reasoning": body.get("reasoning"),
         "max_output_tokens": body.get("max_output_tokens"),
         "text": body.get("text"),
+        "multi_agent": body.get("multi_agent"),
+        "context_management": body.get("context_management"),
     }
     if omitted_items:
         payload["history_truncation"] = {
@@ -694,6 +645,11 @@ def _bridge_prompt_text(
             "after its result appears.",
         ]
     scheduling_text = "\n".join(f"- {rule}" for rule in scheduling_rules)
+    agent_safety = (
+        f"\n\n{AGENT_ORCHESTRATION_GUIDANCE.strip()}"
+        if has_agent_control_tools(tools)
+        else ""
+    )
 
     return f"""You are the model inside a local OpenAI Responses API
 compatibility bridge. Do not invoke {runtime_name}'s own filesystem, shell,
@@ -746,7 +702,7 @@ message. The marker nonce is protocol data and must not appear inside JSON
 fields.
 
 Tool scheduling rules:
-{scheduling_text}
+{scheduling_text}{agent_safety}
 
 RESPONSE_REQUEST_JSON
 {serialized}
@@ -956,7 +912,7 @@ def parse_bridge_output(
         else:
             payload = call.get("input", "")
 
-        if tool_type == "function":
+        if tool_type in {"function", "tool_search"}:
             if isinstance(payload, str):
                 try:
                     decoded_payload = _strict_json_loads(payload)
@@ -1050,6 +1006,24 @@ def output_items(result: BridgeResult) -> list[dict[str, Any]]:
     if result.commentary is not None:
         items.append(_message_item(result.commentary, "commentary"))
     for call in result.tool_calls:
+        if call.tool_type == "tool_search":
+            try:
+                arguments = json.loads(call.payload)
+            except (json.JSONDecodeError, ValueError):
+                arguments = {}
+            if not isinstance(arguments, dict):
+                arguments = {}
+            items.append(
+                {
+                    "id": _id("tsc"),
+                    "type": "tool_search_call",
+                    "status": "completed",
+                    "call_id": _id("call"),
+                    "arguments": arguments,
+                    "execution": "client",
+                }
+            )
+            continue
         if call.tool_type == "custom":
             items.append(
                 {

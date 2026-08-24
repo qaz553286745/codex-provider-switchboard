@@ -14,6 +14,8 @@ managed by the control panel.
 | `SWITCHBOARD_CONFIG` | platform path | Override JSON configuration path |
 | `SWITCHBOARD_MAX_REQUEST_BYTES` | `8388608` | Maximum wire and decoded JSON request body |
 | `SWITCHBOARD_DEBUG_REQUESTS` | `0` | Log content-free request metadata |
+| `SWITCHBOARD_AGENT_LOOP_GUARD` | `1` | Stop repeated Codex subagent interrupt/restart loops locally |
+| `SWITCHBOARD_AGENT_LOOP_RESTART_LIMIT` | `2` | Restart-then-interrupt cycles allowed for one target before termination |
 | `SWITCHBOARD_CODEX_CONFIG` | `~/.codex/config.toml` | Test/automation override for Codex config management |
 | `SWITCHBOARD_LOG_PATH` | per-user application data | Redacted rotating log file |
 | `SWITCHBOARD_LOG_MAX_BYTES` | `5242880` | Bytes per log file before rotation |
@@ -22,6 +24,15 @@ managed by the control panel.
 The earlier `KIRO_PROXY_HOST`, `KIRO_PROXY_PORT`, `KIRO_PROXY_TOKEN`,
 `KIRO_PROXY_CONFIG`, and `KIRO_DEBUG_REQUESTS` names are accepted as migration
 aliases. New deployments should use `SWITCHBOARD_*`.
+
+The subagent loop guard is provider-independent and applies before Kiro,
+Cursor, custom, or direct-provider inference. It resets on a new user message or
+substantive non-control tool call, permits one legitimate interrupt/restart
+correction by default, and returns a normal terminal Responses message when a
+loop is detected. An `agent_message` result also resets the observation window.
+The guard yields to a native hosted multi-agent request because that service owns
+its agent lifecycle. Logs contain only the reason, counts, and a short target
+hash. Disable it only for protocol debugging.
 
 ## Kiro environment
 
@@ -88,6 +99,15 @@ The custom Base URL is user-selected, but remote URLs require HTTPS and cannot
 contain userinfo, query strings, or fragments. Model and quota endpoints must
 be same-origin paths beginning with `/`; HTTP redirects are not followed.
 
+`custom.compatibility_profile` defaults to `function_only`. This accepts Codex
+custom tools, `additional_tools`, dynamic `tool_search` results, and namespaces,
+lowers them to ordinary upstream functions, and restores the original Responses
+items on the way back. Select `native_codex` only for a gateway that explicitly
+implements those Codex Responses extensions, native multi-agent events, the
+required beta/lineage headers, and `/responses/compact`. A wrong native setting
+can expose unsupported fields to the gateway, so it is never inferred from a
+display name.
+
 ## Native direct-provider environment
 
 | Variable | Default | Purpose |
@@ -107,14 +127,26 @@ stored in a separate `credentials.json`, not in `config.json`, and are never
 returned by the API. Switchboard does not read `~/.codex/auth.json`. The file
 uses `0600` permissions but is not encrypted by an OS keychain.
 
-The only local credential import is an explicit dashboard/API action for
-experimental direct Kiro. Source `pi` maps to the fixed
-`~/.pi/agent/auth.json` file; callers cannot supply a path. The importer uses
-bounded, symlink-resistant reads, validates the Pi Kiro OAuth schema, separates
-the packed refresh token from its client metadata, and writes through the same
-atomic `0600` credential store. Kiro CLI does not expose a supported
-credential-export contract, so Switchboard does not guess at or scrape its
-private storage.
+The catalog also fixes a compatibility profile per platform. OpenAI API and
+ChatGPT Codex use `native_codex`; xAI, OpenRouter, and GitHub Copilot use
+`function_only`; Anthropic and Kiro Direct use the prompt bridge. These choices
+cannot be changed through the dashboard.
+
+Switchboard never imports `~/.codex/auth.json`, Kiro CLI storage, or Cursor
+application storage. The one optional import source is Pi's fixed
+`~/.pi/agent/auth.json`. Callers cannot provide another path. The dashboard
+first returns a secret-free preview and can then copy allow-listed Kiro,
+Cursor API-key, OpenAI/ChatGPT Codex, Anthropic, GitHub Copilot, xAI, and
+OpenRouter records. Reads are bounded and reject symlinks, non-regular files,
+permissive modes, oversized content, and malformed credentials. Existing
+Switchboard values are skipped unless overwrite is explicitly confirmed, while
+environment overrides are never replaced. Pi's file and the active provider
+are unchanged.
+
+This import does not install or execute Pi and adds no Pi/Node runtime
+dependency. Kiro CLI does not expose a supported credential-export contract,
+so Switchboard does not guess at or scrape its private storage. Cursor is
+imported only from an exact Pi `cursor` or `cursor-agent` API-key record.
 
 API-key access for OpenAI, Anthropic, xAI, and OpenRouter is the preferred
 stable path. ChatGPT Codex, subscription OAuth, GitHub Copilot, and direct Kiro
@@ -152,6 +184,8 @@ The file contains:
 - whether incoming Codex reasoning should update advertised effort/max fields;
 - the Cursor run timeout.
 - the custom Base URL, model endpoint, and optional quota endpoint/field map.
+- the custom Responses compatibility profile (`function_only` by default or
+  explicit `native_codex`).
 - the selected fixed direct platform, model, timeout, and effort-following flag.
 
 The sibling `credentials.json` contains only direct-provider secrets and refresh
@@ -170,7 +204,8 @@ Use the dashboard's confirmed backup/restore workflow, or manually merge
 layer.
 
 The automatic workflow never runs at application startup. Enabling requires
-the exact confirmation `ENABLE`; restoring requires `RESTORE`. Every enable is
+the exact confirmation `ENABLE`; changing only the agent mode while active
+requires `APPLY`; restoring requires `RESTORE`. Every enable is
 derived from the config file as it exists at that moment. A complete `0600`
 backup is created, but disable validates and restores only the top-level keys,
 individual table keys, and provider entry recorded as Switchboard-managed.
@@ -182,14 +217,25 @@ match the takeover record and leaves the current model in place. If those
 routing values were already removed externally, status automatically clears the
 stale active state so another enable can proceed.
 
+New dashboard takeovers default to single-agent mode, which manages only
+`agents.enabled = false`. This disables Codex's multi-agent tools but leaves
+ordinary terminal, filesystem, browser, and other provider tools available.
+The limited and parallel presets enable agents and set
+`agents.max_concurrent_threads_per_session` to 2 or 4; custom mode accepts a
+bounded value from 1 through 16. Agent fields use the same current-file backup,
+managed-field validation, live `APPLY`, and field-level restore rules as the
+provider route.
+
 When Codex is using its default built-in `openai` provider, the manager selects
 the dedicated `codex-provider-switchboard` provider. Current Codex builds infer
 remote-compaction support from the provider display name: a provider named
 exactly `OpenAI` is expected to return an opaque `compaction` output item for a
-`compaction_trigger` request. Switchboard does not claim that native capability,
-so retaining the built-in identity would make long tasks fail during automatic
-compaction. Existing non-reserved custom provider IDs are retained by
-temporarily replacing only their connection entry.
+`compaction_trigger` request. The normal takeover can route to Kiro or Cursor,
+so it deliberately does not claim that native capability. Existing non-reserved
+custom provider IDs are retained by temporarily replacing only their connection
+entry. Separately, selecting a direct native provider or setting a custom gateway
+to `native_codex` enables profile-gated `/responses/compact` forwarding; it does
+not change the safe identity used by the general takeover route.
 
 The manager does not change `features.enable_request_compression`. HTTP fallback
 accepts bounded `identity`, `gzip`, `deflate`, and `zstd` request bodies, so the

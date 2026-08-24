@@ -1,5 +1,5 @@
 {
-  "version": 4,
+  "version": 5,
   "active_provider": "kiro",
   "kiro": {
     "model_id": "gpt-5.6-sol"
@@ -19,6 +19,7 @@
     "base_url": "https://api.example.com/v1",
     "model_id": "gpt-5.5",
     "model_display_name": "GPT 5.5",
+    "compatibility_profile": "function_only",
     "models_path": "/models",
     "quota_path": "",
     "quota_total_field": "",

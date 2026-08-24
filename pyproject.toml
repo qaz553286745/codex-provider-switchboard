@@ -1,12 +1,20 @@
 [project]
 name = "codex-provider-switchboard"
 version = "0.2.1"
-description = "A local Responses-compatible switchboard for Codex, Kiro CLI, Cursor CLI, and provider APIs"
+description = "A local AI-provider reverse proxy and protocol adapter for Codex"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { file = "LICENSE" }
 authors = [{ name = "Codex Provider Switchboard contributors" }]
-keywords = ["codex", "responses-api", "kiro", "cursor", "proxy"]
+keywords = [
+    "ai-gateway",
+    "codex",
+    "cursor",
+    "kiro",
+    "provider-router",
+    "responses-api",
+    "reverse-proxy",
+]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",
@@ -21,7 +29,6 @@ classifiers = [
     "Typing :: Typed",
 ]
 
-urls = { Homepage = "https://github.com/qaz553286745/codex-provider-switchboard", Repository = "https://github.com/qaz553286745/codex-provider-switchboard", Issues = "https://github.com/qaz553286745/codex-provider-switchboard/issues", Changelog = "https://github.com/qaz553286745/codex-provider-switchboard/blob/main/CHANGELOG.md" }
 dependencies = [
     "fastapi==0.139.0",
     "httpx==0.28.1",
@@ -30,6 +37,13 @@ dependencies = [
     "websockets==16.1.1",
     "zstandard==0.25.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/qaz553286745/codex-provider-switchboard"
+Documentation = "https://github.com/qaz553286745/codex-provider-switchboard#readme"
+Repository = "https://github.com/qaz553286745/codex-provider-switchboard"
+Issues = "https://github.com/qaz553286745/codex-provider-switchboard/issues"
+Changelog = "https://github.com/qaz553286745/codex-provider-switchboard/blob/main/CHANGELOG.md"
 
 [project.scripts]
 codex-provider-switchboard = "codex_provider_switchboard.cli:main"

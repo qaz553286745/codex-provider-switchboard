@@ -16,6 +16,7 @@ from .infrastructure.custom_client import CustomResponsesClient
 from .infrastructure.direct_client import DirectClient
 from .infrastructure.kiro_cli import KiroRunner
 from .infrastructure.oauth import OAuthLoginManager
+from .infrastructure.pi_credentials import PiCredentialImporter
 from .infrastructure.session_cache import SessionCache
 from .providers.cursor import CursorProvider
 from .providers.custom import CustomProvider
@@ -35,6 +36,7 @@ class Runtime:
     custom_client: CustomResponsesClient
     credentials: CredentialStore
     oauth: OAuthLoginManager
+    pi_credentials: PiCredentialImporter
     direct_client: DirectClient
     codex_config: CodexConfigManager
     kiro_provider: KiroProvider
@@ -52,6 +54,7 @@ def build_runtime(
     custom_transport: httpx.AsyncBaseTransport | None = None,
     direct_transport: httpx.AsyncBaseTransport | None = None,
     oauth_transport: httpx.AsyncBaseTransport | None = None,
+    pi_auth_path: Path | None = None,
     kiro_runner: KiroRunner | None = None,
     codex_config_path: Path | None = None,
 ) -> Runtime:
@@ -68,6 +71,7 @@ def build_runtime(
         credentials,
         transport=oauth_transport or direct_transport,
     )
+    pi_credentials = PiCredentialImporter(pi_auth_path)
     direct_client = DirectClient(
         resolved_settings,
         store,
@@ -107,6 +111,7 @@ def build_runtime(
         direct_provider,
         credentials,
         oauth,
+        pi_credentials,
         codex_config,
         inspector,
         {
@@ -126,6 +131,7 @@ def build_runtime(
         custom_client=custom_client,
         credentials=credentials,
         oauth=oauth,
+        pi_credentials=pi_credentials,
         direct_client=direct_client,
         codex_config=codex_config,
         kiro_provider=kiro_provider,

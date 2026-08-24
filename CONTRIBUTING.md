@@ -57,5 +57,6 @@ Do not include personal paths, captured provider output, runtime state, or real
 credentials in fixtures, screenshots, commits, or issue descriptions.
 
 Before opening a pull request, run every command in the verification section of
-[`AGENTS.md`](AGENTS.md). The repository hygiene check reports only the rule,
-file, and line number; it deliberately never prints a suspected credential.
+[`RELEASING.md`](RELEASING.md). The repository hygiene check reports only the
+rule, file, and line number; it deliberately never prints a suspected
+credential.

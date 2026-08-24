@@ -94,11 +94,12 @@ def _candidate_files() -> list[Path]:
         relative_paths = [
             Path(raw.decode("utf-8")) for raw in result.stdout.split(b"\0") if raw
         ]
-        return sorted(
+        candidates = [
             ROOT / path
             for path in relative_paths
             if not any(part in SKIPPED_PARTS for part in path.parts)
-        )
+        ]
+        return sorted(path for path in candidates if path.exists() or path.is_symlink())
     return sorted(
         path
         for path in ROOT.rglob("*")

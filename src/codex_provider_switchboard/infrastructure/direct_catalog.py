@@ -21,6 +21,7 @@ class DirectPlatform:
     env_names: tuple[str, ...]
     default_model: str
     stability: DirectStability
+    compatibility_profile: str
     subscription: bool = False
     note: str = ""
 
@@ -43,6 +44,7 @@ _PLATFORMS = (
         env_names=("OPENAI_API_KEY",),
         default_model="gpt-5.6-sol",
         stability="stable",
+        compatibility_profile="native_codex",
         note="Official OpenAI Responses API using an API key.",
     ),
     DirectPlatform(
@@ -56,6 +58,7 @@ _PLATFORMS = (
         env_names=(),
         default_model="gpt-5.6-sol",
         stability="experimental",
+        compatibility_profile="native_codex",
         subscription=True,
         note=(
             "Uses ChatGPT account OAuth and the Codex backend. The login is official "
@@ -73,6 +76,7 @@ _PLATFORMS = (
         env_names=("ANTHROPIC_API_KEY",),
         default_model="claude-sonnet-4-6",
         stability="stable",
+        compatibility_profile="prompt_bridge",
         note="API-key access is stable; Claude subscription OAuth is experimental.",
     ),
     DirectPlatform(
@@ -86,6 +90,7 @@ _PLATFORMS = (
         env_names=(),
         default_model="gpt-5.6-sol",
         stability="experimental",
+        compatibility_profile="function_only",
         subscription=True,
         note=(
             "Uses GitHub device login and Copilot editor endpoints, which are not a "
@@ -103,6 +108,7 @@ _PLATFORMS = (
         env_names=("XAI_API_KEY",),
         default_model="grok-4",
         stability="stable",
+        compatibility_profile="function_only",
         note="Responses API with API-key access; subscription OAuth is experimental.",
     ),
     DirectPlatform(
@@ -116,6 +122,7 @@ _PLATFORMS = (
         env_names=("OPENROUTER_API_KEY",),
         default_model="openrouter/auto",
         stability="beta",
+        compatibility_profile="function_only",
         note="OpenRouter's OpenAI-compatible Responses API is currently beta.",
     ),
     DirectPlatform(
@@ -129,6 +136,7 @@ _PLATFORMS = (
         env_names=(),
         default_model="gpt-5.6-sol",
         stability="experimental",
+        compatibility_profile="prompt_bridge",
         subscription=True,
         note=(
             "Direct AWS Builder ID/Identity Center path. Kiro CLI remains the "

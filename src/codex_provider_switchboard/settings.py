@@ -117,6 +117,8 @@ class AppSettings:
     direct_max_output_bytes: int = 64 * 1_048_576
     direct_oauth_timeout_seconds: float = 900.0
     oauth_callback_host: str = "127.0.0.1"
+    agent_loop_guard: bool = True
+    agent_loop_restart_limit: int = 2
 
     @classmethod
     def from_env(cls) -> AppSettings:
@@ -263,5 +265,15 @@ class AppSettings:
             ),
             oauth_callback_host=_loopback_host(
                 _first_env("SWITCHBOARD_OAUTH_CALLBACK_HOST", default="127.0.0.1")
+            ),
+            agent_loop_guard=_env_bool(
+                "SWITCHBOARD_AGENT_LOOP_GUARD",
+                default=True,
+            ),
+            agent_loop_restart_limit=_env_int(
+                "SWITCHBOARD_AGENT_LOOP_RESTART_LIMIT",
+                default=2,
+                minimum=1,
+                maximum=10,
             ),
         )

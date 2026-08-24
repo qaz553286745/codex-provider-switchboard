@@ -11,6 +11,21 @@ from typing import Any
 import httpx
 
 from .. import __version__
+from ..compatibility.profiles import compatibility_profile
+from ..compatibility.responses import (
+    AdaptedResponsesRequest,
+    ResponsesCompatibilityError,
+    ResponsesStreamRestorer,
+    adapt_responses_request,
+    forwarded_codex_headers,
+    prepare_compaction_request,
+    restore_response_value,
+)
+from ..compatibility.sse import (
+    ResponsesSSEDecoder,
+    ResponsesSSEError,
+    encode_response_event,
+)
 from .config_store import ConfigStore
 
 _MAX_JSON_BYTES = 4 * 1_048_576
@@ -86,15 +101,18 @@ class CustomResponsesClient:
             raise CustomAPIError("Third-party API key is not configured.")
         return config, api_key
 
-    def _client(self) -> httpx.AsyncClient:
+    def _client(self, extra_headers: dict[str, str] | None = None) -> httpx.AsyncClient:
         config, api_key = self._connection()
         timeout = int(config["timeout_seconds"])
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "User-Agent": f"codex-provider-switchboard/{__version__}",
+        }
+        if extra_headers:
+            headers.update(extra_headers)
         return httpx.AsyncClient(
             base_url=str(config["base_url"]),
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "User-Agent": f"codex-provider-switchboard/{__version__}",
-            },
+            headers=headers,
             timeout=httpx.Timeout(connect=20, read=timeout, write=60, pool=20),
             follow_redirects=False,
             transport=self.transport,
@@ -158,22 +176,45 @@ class CustomResponsesClient:
         except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
             raise CustomAPIError("Third-party API returned invalid JSON.") from exc
 
-    def _response_body(self, body: dict[str, Any], *, stream: bool) -> dict[str, Any]:
+    def _response_body(
+        self, body: dict[str, Any], *, stream: bool
+    ) -> tuple[AdaptedResponsesRequest, dict[str, str]]:
         config, _ = self._connection()
-        payload = dict(body)
+        capabilities = compatibility_profile(
+            str(config.get("compatibility_profile") or "function_only")
+        )
+        try:
+            adapted = adapt_responses_request(body, capabilities)
+        except ResponsesCompatibilityError as exc:
+            raise CustomAPIError(str(exc), status_code=400) from exc
+        payload = adapted.body
+        headers = (
+            forwarded_codex_headers(body) if capabilities.forward_codex_headers else {}
+        )
+        if capabilities.native_multi_agent:
+            multi_agent = body.get("multi_agent")
+            if isinstance(multi_agent, dict) and multi_agent.get("enabled") is True:
+                beta = [
+                    item.strip()
+                    for item in headers.get("OpenAI-Beta", "").split(",")
+                    if item.strip()
+                ]
+                if "responses_multi_agent=v1" not in beta:
+                    beta.append("responses_multi_agent=v1")
+                headers["OpenAI-Beta"] = ", ".join(beta)
         payload.pop("client_metadata", None)
         model_id = str(config.get("model_id") or "")
         if model_id:
             payload["model"] = model_id
         payload["stream"] = stream
-        return payload
+        return AdaptedResponsesRequest(payload, adapted.mapping), headers
 
     async def create_response(self, body: dict[str, Any]) -> dict[str, Any]:
-        payload = self._response_body(body, stream=False)
+        adapted, headers = self._response_body(body, stream=False)
         try:
             async with (
-                self._client() as client,
-                client.stream("POST", "/responses", json=payload) as response,
+                self._client(headers) as client,
+                client.stream("POST", "/responses", json=adapted.body) as response,
             ):
                 raw = await self._read_limited(response)
         except CustomAPIError:
@@ -192,18 +233,65 @@ class CustomResponsesClient:
             ) from exc
         if not isinstance(value, dict):
             raise CustomAPIError("Third-party API returned an unexpected JSON value.")
+        return restore_response_value(value, adapted.mapping)
+
+    async def compact_response(self, body: dict[str, Any]) -> dict[str, Any]:
+        config, _ = self._connection()
+        capabilities = compatibility_profile(
+            str(config.get("compatibility_profile") or "function_only")
+        )
+        if not capabilities.native_compaction:
+            raise CustomAPIError(
+                "The configured third-party compatibility profile does not support "
+                "native Responses compaction.",
+                status_code=400,
+            )
+        model_id = str(config.get("model_id") or body.get("model") or "")
+        try:
+            payload = prepare_compaction_request(body, model=model_id)
+        except ResponsesCompatibilityError as exc:
+            raise CustomAPIError(str(exc), status_code=400) from exc
+        headers = forwarded_codex_headers(body)
+        try:
+            async with (
+                self._client(headers) as client,
+                client.stream("POST", "/responses/compact", json=payload) as response,
+            ):
+                raw = await self._read_limited(response)
+        except CustomAPIError:
+            raise
+        except httpx.HTTPError as exc:
+            raise CustomAPIError(
+                f"Third-party compaction request failed: {type(exc).__name__}."
+            ) from exc
+        if response.status_code >= 400:
+            raise self._error_from_bytes(response.status_code, raw)
+        try:
+            value = json.loads(raw, parse_constant=_reject_json_constant)
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
+            raise CustomAPIError(
+                "Third-party API returned invalid compaction JSON."
+            ) from exc
+        if not isinstance(value, dict):
+            raise CustomAPIError(
+                "Third-party API returned an unexpected compaction value."
+            )
         return value
 
     async def stream_response(self, body: dict[str, Any]) -> AsyncIterator[bytes]:
-        payload = self._response_body(body, stream=True)
+        adapted, forwarded_headers = self._response_body(body, stream=True)
+        restorer = (
+            None if adapted.mapping.empty else ResponsesStreamRestorer(adapted.mapping)
+        )
+        decoder = ResponsesSSEDecoder(event_limit=_MAX_JSON_BYTES)
         stream_bytes = 0
         try:
             async with (
-                self._client() as client,
+                self._client(forwarded_headers) as client,
                 client.stream(
                     "POST",
                     "/responses",
-                    json=payload,
+                    json=adapted.body,
                     headers={"Accept": "text/event-stream"},
                 ) as response,
             ):
@@ -222,9 +310,18 @@ class CustomResponsesClient:
                             "Third-party SSE stream exceeded the byte limit."
                         )
                     if chunk:
-                        yield chunk
+                        if restorer is None:
+                            yield chunk
+                            continue
+                        for event in decoder.feed(chunk):
+                            for restored in restorer.restore(event):
+                                yield encode_response_event(restored)
+                if restorer is not None:
+                    decoder.finish()
         except CustomAPIError:
             raise
+        except ResponsesSSEError as exc:
+            raise CustomAPIError(str(exc)) from exc
         except httpx.HTTPError as exc:
             raise CustomAPIError(
                 f"Third-party Responses stream failed: {type(exc).__name__}."

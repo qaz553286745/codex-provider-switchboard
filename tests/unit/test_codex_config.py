@@ -165,6 +165,99 @@ def test_codex_config_preserves_existing_request_compression_value(tmp_path) -> 
     )
 
 
+def test_codex_config_can_disable_subagents_without_disabling_tools(tmp_path) -> None:
+    config_path = tmp_path / ".codex" / "config.toml"
+    config_path.parent.mkdir()
+    original = (
+        'model = "old"\n'
+        "\n[agents]\n"
+        "enabled = true\n"
+        "max_concurrent_threads_per_session = 7\n"
+        "\n[desktop]\n"
+        'conversationDetailMode = "STEPS"\n'
+    )
+    config_path.write_text(original)
+    manager = CodexConfigManager(
+        _settings(tmp_path), tmp_path / "state.json", config_path=config_path
+    )
+
+    enabled = manager.enable(
+        confirmation="ENABLE",
+        model="gpt-5.6-sol",
+        agents_enabled=False,
+    )
+    active = tomllib.loads(config_path.read_text())
+    assert active["agents"]["enabled"] is False
+    # The concurrency value is not touched in single-agent mode; only the
+    # official multi-agent enable switch is managed.
+    assert active["agents"]["max_concurrent_threads_per_session"] == 7
+    assert enabled["agents"] == {
+        "enabled": False,
+        "configured_enabled": False,
+        "max_concurrent_threads_per_session": 7,
+        "mode": "single",
+        "managed": True,
+        "ordinary_tools_enabled": True,
+    }
+    assert "agents.enabled" in enabled["managed_fields"]
+
+    config_path.write_text(
+        config_path.read_text().replace(
+            'conversationDetailMode = "STEPS"',
+            'conversationDetailMode = "PROSE"',
+        )
+    )
+    restored = manager.disable(confirmation="RESTORE")
+    parsed = tomllib.loads(config_path.read_text())
+    assert restored["active"] is False
+    assert parsed["agents"]["enabled"] is True
+    assert parsed["agents"]["max_concurrent_threads_per_session"] == 7
+    assert parsed["desktop"]["conversationDetailMode"] == "PROSE"
+
+
+def test_codex_agent_mode_can_change_while_takeover_is_active(tmp_path) -> None:
+    config_path = tmp_path / ".codex" / "config.toml"
+    config_path.parent.mkdir()
+    config_path.write_text(
+        'model = "old"\n\n[agents]\nenabled = true\n'
+        "max_concurrent_threads_per_session = 6\n"
+    )
+    manager = CodexConfigManager(
+        _settings(tmp_path), tmp_path / "state.json", config_path=config_path
+    )
+    manager.enable(confirmation="ENABLE", model="gpt-5.6-sol")
+
+    limited = manager.configure_agents(
+        confirmation="APPLY",
+        agents_enabled=True,
+        max_agent_threads=2,
+    )
+    parsed = tomllib.loads(config_path.read_text())
+    assert limited["agents"]["mode"] == "limited"
+    assert parsed["agents"] == {
+        "enabled": True,
+        "max_concurrent_threads_per_session": 2,
+    }
+
+    single = manager.configure_agents(
+        confirmation="APPLY",
+        agents_enabled=False,
+    )
+    parsed = tomllib.loads(config_path.read_text())
+    assert single["agents"]["mode"] == "single"
+    assert parsed["agents"] == {
+        "enabled": False,
+        "max_concurrent_threads_per_session": 6,
+    }
+
+    manager.disable(confirmation="RESTORE")
+    restored = tomllib.loads(config_path.read_text())
+    assert restored["agents"] == {
+        "enabled": True,
+        "max_concurrent_threads_per_session": 6,
+    }
+
+
 def test_codex_config_restores_managed_fields_after_they_drift(tmp_path) -> None:
     config_path = tmp_path / ".codex" / "config.toml"
     config_path.parent.mkdir()

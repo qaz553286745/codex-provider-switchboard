@@ -1,0 +1,111 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      python_version:
+        description: Python used to build and install-test the universal wheel
+        required: true
+        default: "3.11"
+        type: choice
+        options:
+          - "3.11"
+          - "3.12"
+          - "3.13"
+          - "3.14"
+      repository:
+        description: Package index target
+        required: true
+        default: testpypi
+        type: choice
+        options:
+          - testpypi
+          - pypi
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}-${{ inputs.repository || 'pypi' }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build and verify distributions
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out the release commit
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install uv and the requested Python
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+          python-version: ${{ inputs.python_version || '3.11' }}
+
+      - name: Install the locked development environment
+        run: uv sync --locked --all-groups
+
+      - name: Run quality and secret-hygiene gates
+        run: |
+          uv run ruff check .
+          uv run ruff format --check .
+          uv run python scripts/check_repository.py
+
+      - name: Run tests
+        run: uv run pytest --cov
+
+      - name: Build a tag-matched release
+        if: github.event_name == 'push'
+        run: >-
+          uv run python scripts/build_release.py
+          --python "${{ inputs.python_version || '3.11' }}"
+          --expected-tag "${GITHUB_REF_NAME}"
+
+      - name: Build a manually dispatched release candidate
+        if: github.event_name == 'workflow_dispatch'
+        run: >-
+          uv run python scripts/build_release.py
+          --python "${{ inputs.python_version }}"
+
+      - name: Upload verified distributions
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: python-distributions
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish to ${{ github.event_name == 'push' && 'pypi' || inputs.repository }}
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: ${{ github.event_name == 'push' && 'pypi' || inputs.repository }}
+      url: ${{ (github.event_name == 'push' || inputs.repository == 'pypi') && 'https://pypi.org/project/codex-provider-switchboard/' || 'https://test.pypi.org/project/codex-provider-switchboard/' }}
+    permissions:
+      id-token: write
+    steps:
+      - name: Download verified distributions
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: python-distributions
+          path: dist
+
+      - name: Publish to TestPyPI with a trusted identity
+        if: github.event_name == 'workflow_dispatch' && inputs.repository == 'testpypi'
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1.14
+        with:
+          packages-dir: dist/
+          repository-url: https://test.pypi.org/legacy/
+
+      - name: Publish to PyPI with a trusted identity
+        if: github.event_name == 'push' || inputs.repository == 'pypi'
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1.14
+        with:
+          packages-dir: dist/

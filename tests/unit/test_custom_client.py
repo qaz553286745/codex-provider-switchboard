@@ -99,3 +99,79 @@ def test_custom_config_rejects_remote_http_and_cross_origin_paths(tmp_path) -> N
         store.update_from_api(
             {"custom": {"quota_path": "https://collector.example/quota"}}
         )
+    with pytest.raises(ValueError, match="compatibility_profile"):
+        store.update_from_api({"custom": {"compatibility_profile": "unsafe_guess"}})
+
+
+def test_custom_function_profile_restores_client_tool_shape(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.delenv("THIRD_PARTY_API_KEY", raising=False)
+    monkeypatch.delenv("CUSTOM_API_KEY", raising=False)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        assert payload["tools"] == [
+            {
+                "type": "function",
+                "name": "exec",
+                "description": "Run JavaScript.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"input": {"type": "string"}},
+                    "required": ["input"],
+                },
+            }
+        ]
+        assert "multi_agent" not in payload
+        return httpx.Response(
+            200,
+            json={
+                "id": "resp_tool",
+                "object": "response",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "function_call",
+                        "name": "exec",
+                        "call_id": "call_exec",
+                        "arguments": '{"input":"text(true);"}',
+                    }
+                ],
+            },
+        )
+
+    store = ConfigStore(tmp_path / "config.json")
+    store.update_from_api(
+        {
+            "custom": {
+                "api_key": "test_custom_key",
+                "base_url": "https://api.example.com/v1",
+                "model_id": "gpt-test",
+                "compatibility_profile": "function_only",
+            }
+        }
+    )
+    client = CustomResponsesClient(store, transport=httpx.MockTransport(handler))
+    response = asyncio.run(
+        client.create_response(
+            {
+                "input": "inspect",
+                "tools": [
+                    {
+                        "type": "custom",
+                        "name": "exec",
+                        "description": "Run JavaScript.",
+                    }
+                ],
+                "multi_agent": {"enabled": True},
+            }
+        )
+    )
+
+    assert response["output"][0] == {
+        "type": "custom_tool_call",
+        "name": "exec",
+        "call_id": "call_exec",
+        "input": "text(true);",
+    }

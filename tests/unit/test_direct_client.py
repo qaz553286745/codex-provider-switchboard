@@ -11,6 +11,7 @@ from typing import Any
 import httpx
 import pytest
 
+from codex_provider_switchboard.compatibility.responses import bind_transport_context
 from codex_provider_switchboard.infrastructure.config_store import ConfigStore
 from codex_provider_switchboard.infrastructure.credential_store import CredentialStore
 from codex_provider_switchboard.infrastructure.direct_client import (
@@ -361,6 +362,79 @@ def test_openai_direct_client_uses_native_http_and_complete_sse_frames(
     assert models == [{"id": "gpt-test", "displayName": "gpt-test"}]
     assert b"response.completed" in stream
     assert len(seen) == 2
+
+
+def test_openai_native_forwards_multi_agent_beta_lineage_and_namespaces(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=(
+                'data: {"type":"response.created"}\n\n'
+                'data: {"type":"response.completed","response":'
+                '{"id":"resp_native","status":"completed","output":[]}}\n\n'
+            ),
+        )
+
+    settings = _settings(tmp_path)
+    store = ConfigStore(tmp_path / "config.json")
+    store.update_from_api({"direct": {"platform_id": "openai", "model_id": "gpt-test"}})
+    credentials = CredentialStore(tmp_path / "credentials.json")
+    credentials.set_api_key("openai", "sk-test")
+    transport = httpx.MockTransport(handler)
+    client = DirectClient(
+        settings,
+        store,
+        OAuthLoginManager(settings, credentials, transport=transport),
+        transport=transport,
+    )
+    body = bind_transport_context(
+        {
+            "input": "inspect",
+            "multi_agent": {"enabled": True, "max_concurrent_subagents": 2},
+            "tools": [
+                {
+                    "type": "namespace",
+                    "name": "multi_agent_v1",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "spawn_agent",
+                            "parameters": {"type": "object"},
+                        }
+                    ],
+                },
+                {"type": "tool_search"},
+            ],
+        },
+        {
+            "openai-beta": "another_feature=v1",
+            "x-openai-subagent": "worker",
+            "x-codex-parent-thread-id": "parent-thread",
+        },
+    )
+
+    async def scenario() -> bytes:
+        return b"".join([chunk async for chunk in client.stream_responses(body)])
+
+    assert b"response.completed" in asyncio.run(scenario())
+    request = seen[0]
+    beta = request.headers["openai-beta"]
+    assert "another_feature=v1" in beta
+    assert "responses_multi_agent=v1" in beta
+    assert request.headers["x-openai-subagent"] == "worker"
+    assert request.headers["x-codex-parent-thread-id"] == "parent-thread"
+    payload = json.loads(request.content)
+    assert payload["multi_agent"]["enabled"] is True
+    assert payload["tools"][0]["type"] == "namespace"
+    assert payload["tools"][1]["type"] == "tool_search"
+    assert len(seen) == 1
 
 
 def test_direct_responses_stream_requires_terminal_event(monkeypatch, tmp_path) -> None:

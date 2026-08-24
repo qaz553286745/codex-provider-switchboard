@@ -54,7 +54,13 @@ class CustomProvider:
             value = await self.client.create_response(body)
         except CustomAPIError as exc:
             raise ProviderError(
-                str(exc), error_type="custom_api_error", status_code=502
+                str(exc),
+                error_type="custom_api_error",
+                status_code=(
+                    exc.status_code
+                    if isinstance(exc.status_code, int) and 400 <= exc.status_code < 500
+                    else 502
+                ),
             ) from exc
         return ProviderResponse(value, {"X-Switchboard-Provider": self.provider_id})
 

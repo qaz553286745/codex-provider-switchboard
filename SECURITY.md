@@ -40,6 +40,8 @@ The default deployment assumes:
   receives requests only when its provider is active.
 - a selected direct provider receives requests only through its fixed official
   HTTPS origin and built-in protocol adapter.
+- the optional Pi credential import is initiated by the trusted local user and
+  reads only that user's fixed `~/.pi/agent/auth.json` source.
 
 File-backed provider keys are protected with `0600` permissions and an
 application-owned `0700` directory. It is not encrypted with macOS Keychain or
@@ -51,6 +53,8 @@ Direct-provider credentials use a separate atomic `credentials.json` file with
 the same `0600`/`0700` boundary. Environment variables take precedence. This
 file is not an encrypted vault; on shared hosts, use a trusted environment or
 OS secret manager. Switchboard never imports or copies `~/.codex/auth.json`.
+It can copy an allow-listed subset of credentials from Pi only after an
+explicit preview/import action; Pi remains unchanged and is never executed.
 
 ## Implemented controls
 
@@ -69,6 +73,11 @@ OS secret manager. Switchboard never imports or copies `~/.codex/auth.json`.
   OAuth/device flows use fixed endpoints, bounded JSON, no redirects,
   per-platform refresh locks, loopback callbacks, PKCE where supported,
   unguessable login IDs, and redacted status responses.
+- Pi import accepts no caller-provided path, uses a bounded no-follow regular
+  file read, requires no group/world permission bits, validates provider and
+  credential schemas, skips duplicate target mappings and environment
+  overrides, and returns no secret values. Existing Switchboard values are not
+  replaced unless the local user explicitly confirms overwrite.
 - Direct Responses and Anthropic streams release only complete JSON SSE frames.
   Kiro direct mode validates AWS event-stream lengths and both CRC checks before
   decoding payload JSON. Tool arguments are emitted only after complete JSON

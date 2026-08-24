@@ -7,10 +7,8 @@ import json
 import os
 import re
 import secrets
-import stat
 import time
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urlsplit
 
@@ -30,8 +28,6 @@ _GITHUB_COPILOT_CLIENT_ID = "Iv1.b507a08c87ecfe98"
 _MAX_AUTH_BODY = 1 * 1_048_576
 _REFRESH_SKEW_MS = 5 * 60 * 1_000
 _LOGIN_RETENTION_SECONDS = 30 * 60
-_MAX_IMPORT_FILE_BYTES = 512 * 1_024
-_MAX_IMPORT_SECRET_CHARS = 32_768
 _SAFE_MESSAGE = re.compile(r"[^\x20-\x7e\u0080-\uffff]")
 
 _KIRO_SCOPES = (
@@ -177,119 +173,6 @@ def _trusted_https_url(
     return value
 
 
-def _read_bounded_import_json(path: Path) -> dict[str, Any]:
-    for candidate in (path, path.parent, path.parent.parent):
-        if candidate.is_symlink():
-            raise OAuthError("Pi authentication path must not contain a symbolic link.")
-    flags = os.O_RDONLY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    try:
-        descriptor = os.open(path, flags)
-    except FileNotFoundError as exc:
-        raise OAuthError("Pi authentication file was not found.") from exc
-    except OSError as exc:
-        raise OAuthError("Pi authentication file could not be opened safely.") from exc
-    try:
-        file_stat = os.fstat(descriptor)
-        if not stat.S_ISREG(file_stat.st_mode):
-            raise OAuthError("Pi authentication source must be a regular file.")
-        if file_stat.st_size > _MAX_IMPORT_FILE_BYTES:
-            raise OAuthError("Pi authentication file exceeds the size limit.")
-        with os.fdopen(descriptor, "rb") as source:
-            descriptor = -1
-            raw = source.read(_MAX_IMPORT_FILE_BYTES + 1)
-        if len(raw) > _MAX_IMPORT_FILE_BYTES:
-            raise OAuthError("Pi authentication file exceeds the size limit.")
-        value = json.loads(raw)
-    except OAuthError:
-        raise
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise OAuthError("Pi authentication file has an invalid format.") from exc
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-    if not isinstance(value, dict):
-        raise OAuthError("Pi authentication file has an invalid format.")
-    return value
-
-
-def _import_string(record: dict[str, Any], field: str) -> str:
-    value = record.get(field)
-    if not isinstance(value, str):
-        raise OAuthError("Pi Kiro credential is incomplete or invalid.")
-    result = value.strip()
-    if (
-        not result
-        or len(result) > _MAX_IMPORT_SECRET_CHARS
-        or any(ord(character) < 0x20 for character in result)
-    ):
-        raise OAuthError("Pi Kiro credential is incomplete or invalid.")
-    return result
-
-
-def _optional_import_string(record: dict[str, Any], field: str) -> str | None:
-    value = record.get(field)
-    if value is None or value == "":
-        return None
-    return _import_string(record, field)
-
-
-def _pi_kiro_credential(path: Path) -> dict[str, Any]:
-    value = _read_bounded_import_json(path)
-    record = value.get("kiro")
-    if not isinstance(record, dict) or record.get("type") != "oauth":
-        raise OAuthError("Pi Kiro credential is incomplete or invalid.")
-
-    access = _import_string(record, "access")
-    packed_refresh = _import_string(record, "refresh")
-    client_id = _optional_import_string(record, "clientId")
-    client_secret = _optional_import_string(record, "clientSecret")
-    auth_method = _optional_import_string(record, "authMethod")
-    if "|" in packed_refresh:
-        parts = packed_refresh.split("|")
-        if len(parts) != 4 or not all(parts):
-            raise OAuthError("Pi Kiro credential is incomplete or invalid.")
-        refresh, packed_client_id, packed_client_secret, packed_auth_method = parts
-        for explicit, packed in (
-            (client_id, packed_client_id),
-            (client_secret, packed_client_secret),
-            (auth_method, packed_auth_method),
-        ):
-            if explicit is not None and explicit != packed:
-                raise OAuthError("Pi Kiro credential metadata does not match.")
-        client_id = packed_client_id
-        client_secret = packed_client_secret
-        auth_method = packed_auth_method
-    else:
-        refresh = packed_refresh
-
-    expires = record.get("expires")
-    region = _import_string(record, "region")
-    if (
-        client_id is None
-        or client_secret is None
-        or auth_method not in {"idc", "builder-id"}
-        or region not in _KIRO_REGIONS
-        or not isinstance(expires, int)
-        or isinstance(expires, bool)
-        or expires < 0
-    ):
-        raise OAuthError("Pi Kiro credential is incomplete or invalid.")
-    return {
-        "access": access,
-        "refresh": refresh,
-        "expires_at": expires,
-        "extra": {
-            "client_id": client_id,
-            "client_secret": client_secret,
-            "region": region,
-            "auth_method": auth_method,
-            "subscription": True,
-        },
-    }
-
-
 class OAuthLoginManager:
     """Switchboard-owned OAuth coordinator and locked token refresher."""
 
@@ -299,12 +182,10 @@ class OAuthLoginManager:
         credentials: CredentialStore,
         *,
         transport: httpx.AsyncBaseTransport | None = None,
-        pi_auth_path: Path | None = None,
     ) -> None:
         self.settings = settings
         self.credentials = credentials
         self.transport = transport
-        self._pi_auth_path = pi_auth_path or Path.home() / ".pi" / "agent" / "auth.json"
         self._sessions: dict[str, _LoginSession] = {}
         self._sessions_lock = asyncio.Lock()
         self._refresh_locks = {
@@ -587,12 +468,9 @@ class OAuthLoginManager:
             await asyncio.gather(session.task, return_exceptions=True)
         return session.safe_view()
 
-    async def import_credentials(self, platform_id: str, source: str) -> None:
-        if platform_id != "kiro_direct":
-            raise ValueError("Credential import is only supported for Kiro.")
-        if source != "pi":
-            raise ValueError("Unsupported credential import source.")
-        credential = _pi_kiro_credential(self._pi_auth_path)
+    async def cancel_platform_logins(self, platform_id: str) -> None:
+        if platform_id not in DIRECT_PLATFORM_IDS:
+            raise ValueError(f"Unknown direct platform: {platform_id}")
         async with self._sessions_lock:
             tasks = [
                 session.task
@@ -606,12 +484,6 @@ class OAuthLoginManager:
                 task.cancel()
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
-            try:
-                self.credentials.set_oauth(platform_id, **credential)
-            except (CredentialStoreError, ValueError) as exc:
-                raise OAuthError(
-                    "Imported Kiro credential could not be stored."
-                ) from exc
 
     async def close(self) -> None:
         tasks = [

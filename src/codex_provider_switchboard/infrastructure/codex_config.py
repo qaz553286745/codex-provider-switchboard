@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import copy
 import hashlib
 import json
@@ -20,6 +21,7 @@ PROVIDER_ID = "codex-provider-switchboard"
 _STATE_VERSION = 2
 _LEGACY_STATE_VERSION = 1
 _MAX_CONFIG_BYTES = 4 * 1_048_576
+_MAX_AGENT_THREADS = 64
 _RESERVED_PROVIDER_IDS = {"openai", "ollama", "lmstudio", "amazon-bedrock"}
 
 
@@ -186,7 +188,41 @@ class CodexConfigManager:
             raise CodexConfigError("A printable Codex model identifier is required.")
         return value.strip()
 
-    def _plan(self, document: Any, model: str) -> _ManagementPlan:
+    @staticmethod
+    def _agent_table_entries(
+        agents_enabled: Any,
+        max_agent_threads: Any,
+    ) -> dict[str, dict[str, Any]]:
+        if agents_enabled is None:
+            if max_agent_threads is not None:
+                raise CodexConfigError(
+                    "An agent concurrency limit requires an enabled/disabled choice."
+                )
+            return {}
+        if not isinstance(agents_enabled, bool):
+            raise CodexConfigError("Codex agents_enabled must be true or false.")
+        entries: dict[str, Any] = {"enabled": agents_enabled}
+        if agents_enabled:
+            if (
+                not isinstance(max_agent_threads, int)
+                or isinstance(max_agent_threads, bool)
+                or not 1 <= max_agent_threads <= _MAX_AGENT_THREADS
+            ):
+                raise CodexConfigError(
+                    "Codex agent concurrency must be an integer from 1 to 64."
+                )
+            entries["max_concurrent_threads_per_session"] = max_agent_threads
+        return {"agents": entries}
+
+    def _plan(
+        self,
+        document: Any,
+        model: str,
+        *,
+        agents_enabled: Any = None,
+        max_agent_threads: Any = None,
+    ) -> _ManagementPlan:
+        table_entries = self._agent_table_entries(agents_enabled, max_agent_threads)
         configured = _unwrapped(document.get("model_provider"))
         if (
             isinstance(configured, str)
@@ -197,14 +233,14 @@ class CodexConfigManager:
                 mode="existing_provider",
                 provider_id=configured,
                 top_level={"model": model, "model_provider": configured},
-                table_entries={},
+                table_entries=table_entries,
                 provider_entries={configured: self._provider_values()},
             )
         return _ManagementPlan(
             mode="dedicated_provider",
             provider_id=PROVIDER_ID,
             top_level={"model": model, "model_provider": PROVIDER_ID},
-            table_entries={},
+            table_entries=table_entries,
             provider_entries={PROVIDER_ID: self._provider_values()},
         )
 
@@ -568,9 +604,13 @@ class CodexConfigManager:
             else PROVIDER_ID
         )
         managed_names: list[str] = []
+        managed_agent_entries: dict[str, Any] = {}
         if state:
             try:
                 managed = self._managed_from_state(state)
+                raw_agent_entries = managed["table_entries"].get("agents", {})
+                if isinstance(raw_agent_entries, dict):
+                    managed_agent_entries = raw_agent_entries
                 managed_names.extend(sorted(managed["top_level"]))
                 managed_names.extend(
                     f"{table_name}.{key}"
@@ -583,6 +623,31 @@ class CodexConfigManager:
                 )
             except CodexConfigError:
                 pass
+        agents_table = document.get("agents") if document is not None else None
+        configured_agents_enabled: bool | None = None
+        configured_agent_threads: int | None = None
+        if agents_table is not None and hasattr(agents_table, "__contains__"):
+            if "enabled" in agents_table:
+                candidate = _unwrapped(agents_table["enabled"])
+                if isinstance(candidate, bool):
+                    configured_agents_enabled = candidate
+            if "max_concurrent_threads_per_session" in agents_table:
+                candidate = _unwrapped(
+                    agents_table["max_concurrent_threads_per_session"]
+                )
+                if isinstance(candidate, int) and not isinstance(candidate, bool):
+                    configured_agent_threads = candidate
+        effective_agents_enabled = (
+            True if configured_agents_enabled is None else configured_agents_enabled
+        )
+        if not effective_agents_enabled:
+            agent_mode = "single"
+        elif configured_agent_threads == 2:
+            agent_mode = "limited"
+        elif configured_agent_threads == 4:
+            agent_mode = "parallel"
+        else:
+            agent_mode = "custom"
         backup_available = bool(
             state is not None
             and (state.get("original_existed") is not True or backup_exists)
@@ -609,11 +674,20 @@ class CodexConfigManager:
             "history_provider_preserved": mode
             in {"builtin_openai_base_url", "existing_provider"},
             "managed_fields": managed_names,
+            "agents": {
+                "enabled": effective_agents_enabled,
+                "configured_enabled": configured_agents_enabled,
+                "max_concurrent_threads_per_session": configured_agent_threads,
+                "mode": agent_mode,
+                "managed": bool(active and managed_agent_entries),
+                "ordinary_tools_enabled": True,
+            },
             "enabled_at": state.get("enabled_at") if state else None,
             "restored_at": state.get("restored_at") if state else None,
             "restore_method": state.get("restore_method") if state else None,
             "restore_warning": state.get("restore_warning") if state else None,
             "confirmation_enable": "ENABLE",
+            "confirmation_agents": "APPLY",
             "confirmation_restore": "RESTORE",
         }
 
@@ -621,7 +695,14 @@ class CodexConfigManager:
         with self._lock:
             return self._status_locked()
 
-    def enable(self, *, confirmation: Any, model: Any) -> dict[str, Any]:
+    def enable(
+        self,
+        *,
+        confirmation: Any,
+        model: Any,
+        agents_enabled: Any = None,
+        max_agent_threads: Any = None,
+    ) -> dict[str, Any]:
         if confirmation != "ENABLE":
             raise CodexConfigError("Type ENABLE to confirm Codex config takeover.")
         normalized_model = self._model(model)
@@ -643,7 +724,12 @@ class CodexConfigManager:
                     return self._status_locked()
 
             original_existed, original, document = self._read_config()
-            plan = self._plan(document, normalized_model)
+            plan = self._plan(
+                document,
+                normalized_model,
+                agents_enabled=agents_enabled,
+                max_agent_threads=max_agent_threads,
+            )
             managed = plan.state_value()
             self._apply_managed(document, managed)
             managed_bytes = tomlkit.dumps(document).encode("utf-8")
@@ -692,6 +778,87 @@ class CodexConfigManager:
                     pass
                 raise CodexConfigError(
                     f"Could not activate Codex config: {type(exc).__name__}."
+                ) from exc
+            return self._status_locked()
+
+    def configure_agents(
+        self,
+        *,
+        confirmation: Any,
+        agents_enabled: Any,
+        max_agent_threads: Any = None,
+    ) -> dict[str, Any]:
+        if confirmation != "APPLY":
+            raise CodexConfigError(
+                "Type APPLY to confirm the Codex agent configuration change."
+            )
+        table_entries = self._agent_table_entries(agents_enabled, max_agent_threads)
+        with self._lock:
+            state = self._read_state()
+            if not state or state.get("active") is not True:
+                raise CodexConfigError(
+                    "Enable the Switchboard Codex takeover before applying "
+                    "agent settings.",
+                    status_code=409,
+                )
+            if state.get("config_path") != str(self.config_path):
+                raise CodexConfigError(
+                    "Managed Codex config path does not match the current path.",
+                    status_code=409,
+                )
+
+            _, previous_bytes, current = self._read_config()
+            state = self._reconcile_external_restore(state, current)
+            if state.get("active") is not True:
+                raise CodexConfigError(
+                    "The Switchboard Codex route is no longer active.",
+                    status_code=409,
+                )
+            managed = self._managed_from_state(state)
+            if not self._matches_managed(current, managed):
+                raise CodexConfigError(
+                    "A Switchboard-managed Codex field changed after takeover; "
+                    "refusing to overwrite it.",
+                    status_code=409,
+                )
+
+            previous_agent_entries = managed["table_entries"].get("agents")
+            if isinstance(previous_agent_entries, dict) and previous_agent_entries:
+                previous_agent_managed = {
+                    "top_level": {},
+                    "table_entries": {"agents": previous_agent_entries},
+                    "provider_entries": {},
+                }
+                original = self._backup_document(state)
+                if original is not None:
+                    self._restore_managed(current, original, previous_agent_managed)
+                else:
+                    self._remove_matching_managed_values(
+                        current, previous_agent_managed
+                    )
+
+            next_agent_managed = {
+                "top_level": {},
+                "table_entries": table_entries,
+                "provider_entries": {},
+            }
+            self._apply_managed(current, next_agent_managed)
+            managed["table_entries"]["agents"] = table_entries["agents"]
+            updated_state = {
+                **state,
+                "version": _STATE_VERSION,
+                "managed_fields": managed,
+                "agents_updated_at": datetime.now(UTC).isoformat(),
+            }
+            updated_bytes = tomlkit.dumps(current).encode("utf-8")
+            try:
+                _atomic_write(self.config_path, updated_bytes)
+                self._write_state(updated_state)
+            except OSError as exc:
+                with contextlib.suppress(OSError):
+                    _atomic_write(self.config_path, previous_bytes)
+                raise CodexConfigError(
+                    f"Could not update Codex agent settings: {type(exc).__name__}."
                 ) from exc
             return self._status_locked()
 

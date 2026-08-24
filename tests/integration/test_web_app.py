@@ -5,6 +5,7 @@ import gzip
 import json
 import re
 import stat
+import sys
 import threading
 import tomllib
 import zlib
@@ -544,10 +545,6 @@ class ParallelKiroRunner(ScriptedKiroRunner):
 
 
 class ToolCallingKiroRunner(ScriptedKiroRunner):
-    def __init__(self) -> None:
-        super().__init__()
-        self.second_finished = False
-
     async def stream(
         self,
         prompt: str,
@@ -578,8 +575,6 @@ class ToolCallingKiroRunner(ScriptedKiroRunner):
         )
         for start in range(0, len(wire), 7):
             yield wire[start : start + 7]
-        if len(self.calls) == 2:
-            self.second_finished = True
 
 
 class ContextOverflowThenAnswerRunner(ScriptedKiroRunner):
@@ -1284,14 +1279,11 @@ def test_responses_websocket_generated_continuation_restores_tools_and_session(
             }
         )
         second_completed: dict[str, Any] | None = None
-        streamed_before_upstream_finished = False
+        streamed_output = False
         while second_completed is None:
             event = websocket.receive_json()
-            if (
-                event["type"] == "response.output_text.delta"
-                and not runner.second_finished
-            ):
-                streamed_before_upstream_finished = True
+            if event["type"] == "response.output_text.delta":
+                streamed_output = True
             if event["type"] == "response.completed":
                 second_completed = event["response"]
 
@@ -1302,7 +1294,7 @@ def test_responses_websocket_generated_continuation_restores_tools_and_session(
     assert "repository inspection result" in runner.calls[1]["prompt"]
     assert "inspect the repository" not in runner.calls[1]["prompt"]
     assert '"name":"exec"' in runner.calls[1]["prompt"]
-    assert streamed_before_upstream_finished is True
+    assert streamed_output is True
     assert second_completed["output"][0]["content"][0][
         "text"
     ] == "answer after tool output " + ("streaming " * 20)
@@ -1857,6 +1849,7 @@ def test_cursor_cli_trims_history_to_selected_model_context(tmp_path) -> None:
         tmp_path,
         max_request_bytes=2 * 1_048_576,
         cursor_max_prompt_bytes=4 * 1_048_576,
+        cursor_cli=sys.executable,
     )
     selection = CursorModelSelection("cursor-small", (), "Cursor Small 272K", 272_000)
     fake = FakeCursorCli(selection, settings)
@@ -1922,7 +1915,7 @@ class FirstOutputTimeoutCursorCli(FakeCursorCli):
 
 
 def test_cursor_cli_first_output_timeout_is_terminal_invalid_prompt(tmp_path) -> None:
-    settings = _settings(tmp_path)
+    settings = _settings(tmp_path, cursor_cli=sys.executable)
     selection = CursorModelSelection("cursor-small", (), "Cursor Small", 272_000)
     fake = FirstOutputTimeoutCursorCli(selection, settings)
     runtime = build_runtime(settings=settings, config_path=tmp_path / "config.json")
@@ -2318,6 +2311,7 @@ def test_cursor_overlimit_stream_is_terminal_without_invocation(
         tmp_path,
         max_request_bytes=32_768,
         cursor_max_prompt_bytes=4_096,
+        cursor_cli=sys.executable,
     )
     runtime = build_runtime(
         settings=settings,

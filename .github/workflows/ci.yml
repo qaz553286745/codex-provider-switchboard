@@ -43,7 +43,34 @@ jobs:
           enable-cache: true
           python-version: ${{ matrix.python-version }}
       - run: uv sync --locked --all-groups
-      - run: uv run pytest --cov
+      - name: Run tests
+        run: |
+          set +e
+          uv run pytest --cov --junitxml=pytest-results.xml
+          status=$?
+          if [ "$status" -ne 0 ]; then
+            PYTEST_EXIT_STATUS="$status" uv run python - <<'PY'
+          import os
+          import xml.etree.ElementTree as ET
+
+          report = ET.parse("pytest-results.xml")
+          for case in report.iter("testcase"):
+              if case.find("failure") is None and case.find("error") is None:
+                  continue
+              node_id = "::".join(
+                  part
+                  for part in (case.get("classname"), case.get("name"))
+                  if part
+              )
+              safe_node_id = node_id.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+              print(
+                  f"::error title=pytest failure::{safe_node_id or 'unknown test'}",
+                  flush=True,
+              )
+          raise SystemExit(int(os.environ["PYTEST_EXIT_STATUS"]))
+          PY
+          fi
+          exit "$status"
 
   build:
     runs-on: ubuntu-latest

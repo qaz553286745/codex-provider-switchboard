@@ -164,6 +164,40 @@ def test_running_exec_session_is_detected_and_explained_to_direct_models() -> No
     assert "tools.write_stdin" in anthropic["tools"][0]["description"]
 
 
+def test_direct_payloads_explain_plugin_skill_bootstrap() -> None:
+    tool_variants = (
+        [
+            {
+                "type": "custom",
+                "name": "exec",
+                "description": "Run JavaScript that can call nested tools.",
+            }
+        ],
+        [{"type": "tool_search"}],
+    )
+    for tools in tool_variants:
+        body = {
+            "instructions": (
+                "Available skill: chrome:control-chrome at /plugins/chrome/SKILL.md"
+            ),
+            "tools": tools,
+            "input": "Use the explicitly selected Chrome plugin.",
+        }
+
+        anthropic, _ = responses_to_anthropic(body, "claude-test")
+        kiro, _ = responses_to_kiro(body, "gpt-5.6-sol")
+        kiro_content = kiro["conversationState"]["currentMessage"]["userInputMessage"][
+            "content"
+        ]
+
+        for system in (anthropic["system"], kiro_content):
+            assert "Codex plugin and skill contract" in system
+            assert "does not need to expose a directly callable tool" in system
+            assert "Use ``tool_search``" in system
+            assert "bootstrap through ``exec``" in system
+            assert "Do not substitute another surface" in system
+
+
 def test_completed_write_stdin_result_clears_pending_exec_session() -> None:
     body = _running_exec_body()
     body["input"].extend(

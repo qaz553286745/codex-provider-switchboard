@@ -67,6 +67,23 @@ Codex background-command continuation contract:
 - Repeat polling while a ``session_id`` is returned. Only use the final command
   result after a numeric ``exit_code`` is present.
 """.strip()
+_PLUGIN_SKILL_GUIDANCE = """
+Codex plugin and skill contract:
+- When the user explicitly names a plugin, or the applicable instructions list a
+  skill for the requested capability, read and follow that skill before deciding
+  whether the capability is available.
+- A plugin does not need to expose a directly callable tool with the same name.
+  Do not search only visible tool names, fail to find the plugin name, and report
+  the plugin unavailable.
+- Use ``tool_search`` when provided to load deferred plugin, connector, or MCP
+  tools. If the skill specifies bootstrap through ``exec`` or a nested runtime
+  tool, invoke ``exec`` and follow that bootstrap exactly, including loading
+  plugin-owned scripts and reading required runtime documentation.
+- Distinguish skill discovery, executable-tool discovery, and runtime connection.
+  Report a plugin unavailable only after the skill's required discovery or
+  bootstrap has actually failed. Do not substitute another surface when the user
+  explicitly selected that plugin.
+""".strip()
 
 
 def _with_agent_guidance(system: str, tools: list[dict[str, Any]]) -> str:
@@ -74,6 +91,15 @@ def _with_agent_guidance(system: str, tools: list[dict[str, Any]]) -> str:
         return system
     guidance = AGENT_ORCHESTRATION_GUIDANCE.strip()
     return f"{system}\n\n{guidance}" if system else guidance
+
+
+def _with_plugin_skill_guidance(system: str, tools: list[dict[str, Any]]) -> str:
+    has_discovery_or_runtime = any(
+        _is_exec_tool(tool) or tool.get("type") == "tool_search" for tool in tools
+    )
+    if not has_discovery_or_runtime:
+        return system
+    return f"{system}\n\n{_PLUGIN_SKILL_GUIDANCE}" if system else _PLUGIN_SKILL_GUIDANCE
 
 
 @dataclass(frozen=True, slots=True)
@@ -646,6 +672,7 @@ def responses_to_anthropic(
     instructions = body.get("instructions")
     system = instructions if isinstance(instructions, str) else ""
     system = _with_agent_guidance(system, list(catalog.values()))
+    system = _with_plugin_skill_guidance(system, list(catalog.values()))
     system = _with_tool_continuation_guidance(system, body, list(catalog.values()))
     if system:
         payload["system"] = system
@@ -672,6 +699,7 @@ def responses_to_kiro(
     instructions = body.get("instructions")
     system = instructions if isinstance(instructions, str) else ""
     system = _with_agent_guidance(system, list(catalog.values()))
+    system = _with_plugin_skill_guidance(system, list(catalog.values()))
     system = _with_tool_continuation_guidance(system, body, list(catalog.values()))
     effort = kiro_effort_from_body(body)
     if effort:

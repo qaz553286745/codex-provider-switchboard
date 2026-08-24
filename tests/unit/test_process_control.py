@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from codex_provider_switchboard.infrastructure.process_control import (
+    _linux_process_group_has_live_members,
     isolated_subprocess_kwargs,
     terminate_process_tree,
 )
@@ -18,6 +19,16 @@ def _process_exists(pid: int) -> bool:
         os.kill(pid, 0)
     except ProcessLookupError:
         return False
+    if sys.platform.startswith("linux"):
+        try:
+            raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        except OSError:
+            return False
+        closing = raw.rfind(")")
+        if closing >= 0:
+            fields = raw[closing + 1 :].split()
+            if fields and fields[0] == "Z":
+                return False
     return True
 
 
@@ -27,6 +38,25 @@ async def _wait_for_file(path: Path) -> None:
             return
         await asyncio.sleep(0.02)
     raise AssertionError(f"Timed out waiting for {path}")
+
+
+def test_linux_process_group_ignores_zombie_members(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(sys, "platform", "linux")
+    zombie = tmp_path / "101"
+    zombie.mkdir()
+    (zombie / "stat").write_text(
+        "101 (terminated worker) Z 1 42 42 0 0 0\n", encoding="utf-8"
+    )
+
+    assert not _linux_process_group_has_live_members(42, proc=tmp_path)
+
+    live = tmp_path / "102"
+    live.mkdir()
+    (live / "stat").write_text(
+        "102 (active worker) S 1 42 42 0 0 0\n", encoding="utf-8"
+    )
+
+    assert _linux_process_group_has_live_members(42, proc=tmp_path)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX process groups required")

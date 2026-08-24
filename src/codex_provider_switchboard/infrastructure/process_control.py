@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import os
 import signal
+import sys
+from pathlib import Path
 from typing import Any
 
 
@@ -13,6 +15,54 @@ def isolated_subprocess_kwargs() -> dict[str, Any]:
     return {}
 
 
+def _linux_process_group_has_live_members(
+    process_group_id: int,
+    *,
+    proc: Path = Path("/proc"),
+) -> bool | None:
+    """Return whether a Linux process group contains a non-zombie member.
+
+    ``killpg(pgid, 0)`` reports success while a killed process is waiting to be
+    reaped.  Those zombie-only groups have already stopped executing and must
+    not keep shutdown waiting.  ``None`` asks the caller to retain the portable
+    POSIX result when procfs is unavailable or cannot be inspected.
+    """
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        entries = list(proc.iterdir())
+    except OSError:
+        return None
+
+    matched_group = False
+    for entry in entries:
+        if not entry.name.isdecimal():
+            continue
+        try:
+            raw = (entry / "stat").read_text(encoding="utf-8")
+        except OSError:
+            continue
+        # /proc/<pid>/stat wraps the command name in parentheses.  Split after
+        # the final closing parenthesis because the name itself may contain
+        # spaces or parentheses.  The following fields are state, ppid, pgrp.
+        closing = raw.rfind(")")
+        if closing < 0:
+            continue
+        fields = raw[closing + 1 :].split()
+        if len(fields) < 3:
+            continue
+        try:
+            member_group = int(fields[2])
+        except ValueError:
+            continue
+        if member_group == process_group_id:
+            matched_group = True
+            if fields[0] != "Z":
+                return True
+
+    return False if matched_group else None
+
+
 def _process_group_exists(process_group_id: int) -> bool:
     try:
         os.killpg(process_group_id, 0)
@@ -20,7 +70,8 @@ def _process_group_exists(process_group_id: int) -> bool:
         return False
     except PermissionError:
         return True
-    return True
+    linux_live_members = _linux_process_group_has_live_members(process_group_id)
+    return True if linux_live_members is None else linux_live_members
 
 
 async def _wait_for_process_group_exit(

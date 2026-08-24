@@ -399,23 +399,14 @@ class ResponsesWebSocketConnection:
             await self._shutdown()
 
     async def _receive(self) -> dict[str, Any]:
-        receive = asyncio.create_task(
-            _websocket_json_body(self.websocket, self.settings.max_request_bytes)
+        # Await the ASGI receive directly.  Creating a second task to race an
+        # internal closed event leaves the surrounding AnyIO cancellation scope
+        # cancelled on Python 3.14 when the losing task is reaped.  The ASGI
+        # server already delivers ``websocket.disconnect`` when the transport
+        # closes, including after a send failure.
+        return await _websocket_json_body(
+            self.websocket, self.settings.max_request_bytes
         )
-        closed = asyncio.create_task(self._transport_closed.wait())
-        try:
-            done, _ = await asyncio.wait(
-                {receive, closed}, return_when=asyncio.FIRST_COMPLETED
-            )
-            # Prefer the receive result when both tasks finish together. That
-            # consumes WebSocketDisconnect instead of leaving an unobserved
-            # child-task exception during ASGI connection teardown.
-            if receive in done:
-                return receive.result()
-            raise _ClientDisconnected
-        finally:
-            await _cancel_task(receive)
-            await _cancel_task(closed)
 
     async def _dispatch(self, value: dict[str, Any]) -> None:
         body = dict(value)
